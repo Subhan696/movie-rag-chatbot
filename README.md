@@ -23,29 +23,17 @@ The `movie-rag-chatbot` is an intelligent, interactive chatbot that allows users
 
 | Tool       | Purpose                          |
 | ---------- | -------------------------------- |
-| OpenAI | GPT-3.5-Turbo for Q\&A logic     |
+| Gemini | gemini-2.0-flash-001 for Q\&A logic     |
 | Gradio | Interactive web UI               |
 | Pandas | Data handling and processing     |
 | .env   | Secure API key management        |
 | Excel  | Both input data and user logging |
 
- 📂 Structure
-```bash
-movie-rag-chatbot/
-├── app/
-│   └── movie_chatbot.py        Main chatbot logic
-├── data/
-│   ├── Hollywood_Top_Movies.xlsx   Movie knowledge base
-│   └── user_info.xlsx          Stores collected user info
-├── .env.example                Environment variable template
-├── requirements.txt            Required Python packages
-└── README.md
-```
-
  🛠️ Setup
 1. Clone the repository
-2. Run `pip install -r requirements.txt`
-3. Rename `.env.example` to `.env` and add your OpenAI key
+2. Run `pip install pandas python-dotenv gradio google-generativeai
+`
+3. Create `.env` and add your Gemini API key
 4. Run the chatbot
 
 ```bash
