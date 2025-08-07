@@ -10,7 +10,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 📁 Paths
-MOVIE_PATH = r"H:\Subhan\Hollywood_Top_Movies.xlsx"
+MOVIE_PATH = r"H:\\Subhan\\Hollywood_Top_Movies.xlsx"
 EXCEL_FILE = "user_info.xlsx"
 
 # 🔷 Load Movie Data
@@ -52,9 +52,6 @@ def save_user_info(session):
 
 # 🔷 Gemini query using full chat history + personalization
 def query_gpt(user_query, session):
-    """
-    Sends user’s question to Gemini AI with the movie dataset and chat history, and returns the response.
-    """
     user_name = session.get("name", "User")
     user_location = session.get("location", "their location")
 
@@ -66,16 +63,12 @@ def query_gpt(user_query, session):
         f"Refer to chat history to keep continuity in your responses."
     )
 
-    # Limit to recent 5 interactions if needed
     recent_history = session["chat_history"][-5:]
-
-    # Format chat history for prompt
     history_text = ""
     for turn in recent_history:
         role = turn["role"].capitalize()
         history_text += f"{role}: {turn['content']}\n"
 
-    # Compose prompt
     prompt = (
         f"{system_message}\n\n"
         f"### CHAT HISTORY:\n{history_text}\n"
@@ -84,14 +77,17 @@ def query_gpt(user_query, session):
     )
 
     model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Sorry {user_name}, I encountered an error while fetching the response. Please try again later."
 
 # 🔷 Handle input from user
 def handle_input(user_input, session):
     if session["first_prompt"]:
         session["first_prompt"] = False
-        return "Hello! 👋\nMay I have your name, please?\n", session
+        return "Hello! \U0001F44B\nMay I have your name, please?\n", session
 
     if not session["collected"]:
         if not session["name"]:
@@ -108,18 +104,13 @@ def handle_input(user_input, session):
             session["collected"] = True
             save_user_info(session)
             return (
-                f"Awesome, {session['name']} from {session['location']}! 🎉\n"
+                f"Awesome, {session['name']} from {session['location']}! \U0001F389\n"
                 f"You can now ask me anything about Hollywood movies — cast, director, box office, or where to stream them. "
-                f"Let's get started! 🍿"
+                f"Let's get started! \U0001F37F"
             ), session
 
-    # Add user message to history
     session["chat_history"].append({"role": "user", "content": user_input})
-
-    # Get AI response using chat history
     movie_response = query_gpt(user_input, session)
-
-    # Add assistant response to history
     session["chat_history"].append({"role": "assistant", "content": movie_response})
 
     return movie_response, session
@@ -135,7 +126,7 @@ def on_clear():
 
 # 🔷 Gradio app
 with gr.Blocks() as demo:
-    gr.Markdown("## 🎬 Hollywood Movie Chatbot + User Info")
+    gr.Markdown("## \U0001F3AC Hollywood Movie Chatbot + User Info")
     chatbot = gr.Chatbot()
     msg = gr.Textbox(label="Your Message", placeholder="Hi!")
     clear = gr.Button("Clear Chat")
