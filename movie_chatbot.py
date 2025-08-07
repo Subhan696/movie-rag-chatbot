@@ -26,7 +26,7 @@ for _, row in df.iterrows():
         f"Available on: {row['Streaming']}. Length: {row['Runtime (min)']} minutes.\n"
     )
 
-# 🔷 Sample prompts
+# 🔷 Sample prompts (optional, not used here but can be integrated in UI)
 SAMPLE_PROMPTS = [
     "Who directed Titanic?",
     "Which movie has the highest box office earnings?",
@@ -74,32 +74,44 @@ def save_user_info(session):
         df = pd.DataFrame([user_info])
     df.to_excel(EXCEL_FILE, index=False)
 
-# 🔷 Gemini query
-def query_gpt(user_query):
+# 🔷 Gemini query using full chat history
+def query_gpt(user_query, session):
     """
-    Sends user’s question to Gemini AI with the movie dataset and returns the response.
+    Sends user’s question to Gemini AI with the movie dataset and chat history, and returns the response.
     """
     system_message = (
         "You are a helpful assistant with access to a Hollywood movie dataset. "
-        "First, answer if the data is available in the dataset provided. "
-        "If the answer is not in the dataset, check from outside the dataset using the Gemini model."
+        "Use the dataset to answer the user's queries. "
+        "Refer to the chat history to maintain context and continuity in your responses. "
+        "If information is missing, make a best guess or use external knowledge."
     )
 
-    prompt = f"{system_message}\n\nHere is the movie data:\n{movie_knowledge}\n\nQuestion: {user_query}"
+    # Limit to recent 5 interactions if needed
+    recent_history = session["chat_history"][-5:]
 
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")  # ✅ Correct model path
+    # Format chat history for prompt
+    history_text = ""
+    for turn in recent_history:
+        role = turn["role"].capitalize()
+        history_text += f"{role}: {turn['content']}\n"
+
+    # Compose prompt
+    prompt = (
+        f"{system_message}\n\n"
+        f"Here is the chat history:\n{history_text}\n"
+        f"Here is the movie data:\n{movie_knowledge}\n"
+        f"User's current question: {user_query}"
+    )
+
+    model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
     response = model.generate_content(prompt)
     return response.text.strip()
 
-# 🔷 Handle input
+# 🔷 Handle input from user
 def handle_input(user_input, session):
     if session["first_prompt"]:
         session["first_prompt"] = False
-        welcome_message = (
-            "Hello! 👋\n"
-            "May I have your name, please?\n\n"
-        )
-        return welcome_message, session
+        return "Hello! 👋\nMay I have your name, please?\n", session
 
     if not session["collected"]:
         if not session["name"]:
@@ -115,12 +127,20 @@ def handle_input(user_input, session):
             session["location"] = user_input.strip()
             session["collected"] = True
             save_user_info(session)
-            return (f"Thank you, {session['name']} from {session['location']}.\n"
-                    "You can now ask me anything about the Hollywood movies in our dataset!"), session
+            return (
+                f"Thank you, {session['name']} from {session['location']}.\n"
+                "You can now ask me anything about the Hollywood movies in our dataset!"
+            ), session
 
+    # Add user message to history
     session["chat_history"].append({"role": "user", "content": user_input})
-    movie_response = query_gpt(user_input)
+
+    # Get AI response using chat history
+    movie_response = query_gpt(user_input, session)
+
+    # Add assistant response to history
     session["chat_history"].append({"role": "assistant", "content": movie_response})
+
     return movie_response, session
 
 # 🔷 Gradio callbacks
