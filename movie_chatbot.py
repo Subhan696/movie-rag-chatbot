@@ -26,30 +26,6 @@ for _, row in df.iterrows():
         f"Available on: {row['Streaming']}. Length: {row['Runtime (min)']} minutes.\n"
     )
 
-# 🔷 Sample prompts (optional, not used here but can be integrated in UI)
-SAMPLE_PROMPTS = [
-    "Who directed Titanic?",
-    "Which movie has the highest box office earnings?",
-    "Name a movie starring Leonardo DiCaprio.",
-    "Which movies were released in 1994?",
-    "What is the IMDb rating of The Godfather?",
-    "Which movies are available on Netflix?",
-    "List movies in the Action genre.",
-    "Who acted in Inception?",
-    "What is the runtime of Avatar?",
-    "Which movie won the most Oscars?",
-    "Tell me about the movie The Dark Knight.",
-    "Who is the director of Jurassic Park?",
-    "What are the movies in the Comedy genre?",
-    "Which movies feature Tom Hanks?",
-    "Give me details about the movie Forrest Gump.",
-    "Which movie has the longest runtime?",
-    "List movies directed by Steven Spielberg.",
-    "What is the description of the movie Interstellar?",
-    "Name a movie released after 2010 with high IMDb rating.",
-    "Which movies are available on Amazon Prime?"
-]
-
 # 🔷 Session state
 def init_session():
     return {
@@ -74,16 +50,20 @@ def save_user_info(session):
         df = pd.DataFrame([user_info])
     df.to_excel(EXCEL_FILE, index=False)
 
-# 🔷 Gemini query using full chat history
+# 🔷 Gemini query using full chat history + personalization
 def query_gpt(user_query, session):
     """
     Sends user’s question to Gemini AI with the movie dataset and chat history, and returns the response.
     """
+    user_name = session.get("name", "User")
+    user_location = session.get("location", "their location")
+
     system_message = (
-        "You are a helpful assistant with access to a Hollywood movie dataset. "
-        "Use the dataset to answer the user's queries. "
-        "Refer to the chat history to maintain context and continuity in your responses. "
-        "If information is missing, make a best guess or use external knowledge."
+        f"You are a friendly and helpful assistant answering questions about Hollywood movies. "
+        f"The user you're helping is named {user_name} from {user_location}. "
+        f"Make your responses conversational and, when natural, refer to them by name. "
+        f"Use only the movie dataset unless asked general knowledge. "
+        f"Refer to chat history to keep continuity in your responses."
     )
 
     # Limit to recent 5 interactions if needed
@@ -98,9 +78,9 @@ def query_gpt(user_query, session):
     # Compose prompt
     prompt = (
         f"{system_message}\n\n"
-        f"Here is the chat history:\n{history_text}\n"
-        f"Here is the movie data:\n{movie_knowledge}\n"
-        f"User's current question: {user_query}"
+        f"### CHAT HISTORY:\n{history_text}\n"
+        f"### MOVIE DATA:\n{movie_knowledge}\n"
+        f"### USER QUESTION:\n{user_query}"
     )
 
     model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
@@ -128,8 +108,9 @@ def handle_input(user_input, session):
             session["collected"] = True
             save_user_info(session)
             return (
-                f"Thank you, {session['name']} from {session['location']}.\n"
-                "You can now ask me anything about the Hollywood movies in our dataset!"
+                f"Awesome, {session['name']} from {session['location']}! 🎉\n"
+                f"You can now ask me anything about Hollywood movies — cast, director, box office, or where to stream them. "
+                f"Let's get started! 🍿"
             ), session
 
     # Add user message to history
