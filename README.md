@@ -37,7 +37,7 @@ The `movie-rag-chatbot` is an intelligent, interactive chatbot that allows users
 4. Run the chatbot
 
 ```bash
-python app/movie_chatbot.py
+python movie_chatbot.py
 ```
 Here’s a detailed and professional project description for your `movie-rag-chatbot` GitHub repository:
 
