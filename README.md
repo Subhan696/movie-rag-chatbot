@@ -1,5 +1,7 @@
 
 
+
+
 🎬 `movie-rag-chatbot` – Conversational Movie Q\&A with OpenAI + Gradio
 The `movie-rag-chatbot` is an intelligent, interactive chatbot that allows users to ask natural language questions about a curated dataset of top Hollywood movies. It combines Large Language Models (LLMs), Retrieval-Augmented Generation (RAG), and Gradio to deliver accurate and conversational insights based solely on the dataset.
 
