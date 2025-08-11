@@ -35,6 +35,8 @@ class MovieDataProcessor:
     def load_and_process_data(self):
         """Load and process movie data from Astra vector database"""
         try:
+            print("🔄 Starting data loading process...")
+            
             # Try to load from Astra first
             if self.astra_connector.test_connection():
                 print("✅ Connected to Astra vector database")
@@ -43,14 +45,15 @@ class MovieDataProcessor:
                 print("⚠️ Astra connection failed, using sample data")
                 self.load_sample_data()
         except Exception as e:
-            print(f"Error loading data: {e}")
+            print(f"❌ Error loading data: {e}")
+            print("🔄 Falling back to sample data...")
             self.load_sample_data()
     
     def load_from_astra(self):
         """Load data from Astra vector database"""
         try:
-            # Get all vector data
-            all_vectors = self.astra_connector.get_all_vectors(limit=1000)
+            # Get a good sample of vector data (5000 records)
+            all_vectors = self.astra_connector.get_all_vectors(limit=5000)
             if not all_vectors:
                 print("❌ No data found in Astra, using sample data")
                 self.load_sample_data()
@@ -58,7 +61,7 @@ class MovieDataProcessor:
             
             # Convert to DataFrame
             self.df = pd.DataFrame(all_vectors)
-            print(f"✅ Loaded {len(self.df)} records from Astra")
+            print(f"✅ Loaded {len(self.df)} records from Astra (sample from 113,219+ total)")
             
             # Show what fields we have
             print(f"📋 Available fields: {list(self.df.columns)}")
@@ -88,12 +91,11 @@ class MovieDataProcessor:
             # Extract text fields from vector records
             text_fields = []
             
-            # Look for common text fields - expanded list
+            # Look for common text fields - optimized for your existing database structure
             text_field_names = [
-                'text', 'content', 'description', 'title', 'name', 'summary', 
-                'movie_name', 'movie_title', 'movie', 'film', 'plot', 'synopsis',
-                'director', 'cast', 'actors', 'genre', 'year', 'rating', 'imdb_rating',
-                'box_office', 'runtime', 'duration', 'streaming', 'platform'
+                'title', 'description', 'director', 'cast', 'genre', 'year', 
+                'rating', 'box_office', 'runtime', 'streaming_platforms',
+                'imdb_id', 'text', 'release_date', 'where_to_watch'  # Your existing fields
             ]
             
             for field in text_field_names:
@@ -274,28 +276,33 @@ class AstraConnector:
     def test_connection(self) -> bool:
         """Test connection to Astra database"""
         if not self.base_url or not self.headers:
+            print("❌ Astra configuration incomplete - missing base_url or headers")
             return False
         
         try:
             params = {'where': '{}', 'limit': 1}
             response = requests.get(self.base_url, headers=self.headers, params=params, timeout=10)
+            print(f"🔗 Astra connection test: {response.status_code}")
             return response.status_code == 200
         except Exception as e:
             print(f"❌ Astra connection error: {e}")
             return False
     
-    def get_all_vectors(self, limit: int = 1000) -> List[Dict]:
-        """Get all vector data from Astra"""
+    def get_all_vectors(self, limit: int = 5000) -> List[Dict]:
+        """Get vector data from Astra - increased limit for large datasets"""
         if not self.base_url or not self.headers:
             return []
         
         try:
+            # For large datasets, we'll get a good sample
             params = {'where': '{}', 'limit': limit}
             response = requests.get(self.base_url, headers=self.headers, params=params)
             
             if response.status_code == 200:
                 data = response.json()
-                return data.get('data', [])
+                records = data.get('data', [])
+                print(f"📊 Retrieved {len(records)} records from your database of 113,219+ movies")
+                return records
             else:
                 print(f"Failed to get vectors: {response.status_code}")
                 return []
@@ -309,10 +316,10 @@ class SessionManager:
         self.conversation_log = self.load_conversation_log()
     
     def init_session(self):
-        return {
-            "name": None, "phone": None, "email": None, "location": None,
-            "collected": False,
-            "chat_history": [],
+    return {
+        "name": None, "phone": None, "email": None, "location": None,
+        "collected": False,
+        "chat_history": [],
             "first_prompt": True,
             "session_id": f"session_{int(time.time())}",
             "start_time": datetime.now().isoformat(),
@@ -360,20 +367,20 @@ class UserDataManager:
     def save_user_info(self, session):
         """Save user information with enhanced validation"""
         try:
-            user_info = {
-                "Name": session["name"],
-                "Phone": session["phone"],
-                "Email": session["email"],
+    user_info = {
+        "Name": session["name"],
+        "Phone": session["phone"],
+        "Email": session["email"],
                 "Location": session["location"],
                 "Registration_Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "Session_ID": session["session_id"]
-            }
+    }
             
             if os.path.exists(self.excel_file):
                 df = pd.read_excel(self.excel_file)
-                df = pd.concat([df, pd.DataFrame([user_info])], ignore_index=True)
-            else:
-                df = pd.DataFrame([user_info])
+        df = pd.concat([df, pd.DataFrame([user_info])], ignore_index=True)
+    else:
+        df = pd.DataFrame([user_info])
             
             df.to_excel(self.excel_file, index=False)
             return True
@@ -428,7 +435,16 @@ class MovieRecommender:
         return genre_movies[:top_k]
 
 # 🔷 Initialize components
+print("🚀 Initializing Movie Chatbot...")
 movie_processor = MovieDataProcessor()
+
+# Check if data was loaded successfully
+if movie_processor.df is not None and len(movie_processor.df) > 0:
+    print(f"✅ Chatbot loaded {len(movie_processor.df)} movies successfully!")
+    print(f"📋 Available fields: {list(movie_processor.df.columns)}")
+else:
+    print("⚠️ Chatbot loaded sample data (no Astra connection)")
+
 session_manager = SessionManager()
 user_data_manager = UserDataManager(EXCEL_FILE)
 movie_recommender = MovieRecommender(movie_processor)
@@ -438,7 +454,7 @@ def query_gemini(user_query: str, session: Dict, relevant_movies: List[Dict] = N
     """Enhanced query function with better RAG and error handling"""
     user_name = session.get("name", "User")
     user_location = session.get("location", "their location")
-    
+
     # Get relevant movies if not provided
     if relevant_movies is None:
         relevant_movies = movie_processor.search_movies(user_query, top_k=3)
@@ -463,7 +479,7 @@ def query_gemini(user_query: str, session: Dict, relevant_movies: List[Dict] = N
     for turn in recent_history:
         role = turn["role"].capitalize()
         history_text += f"{role}: {turn['content']}\n"
-    
+
     prompt = (
         f"{system_message}\n\n"
         f"### RECENT CONVERSATION:\n{history_text}\n"
@@ -471,7 +487,7 @@ def query_gemini(user_query: str, session: Dict, relevant_movies: List[Dict] = N
         f"### USER QUESTION:\n{user_query}\n\n"
         f"Please provide a helpful and accurate response based on the movie information provided."
     )
-    
+
     model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
     try:
         response = model.generate_content(prompt)
@@ -487,7 +503,7 @@ def handle_input(user_input: str, session: Dict) -> tuple[str, Dict]:
     if session["first_prompt"]:
         session["first_prompt"] = False
         return "Hello! 👋\nWelcome to the Movie Expert Chatbot! 🎬\nMay I have your name, please?", session
-    
+
     if not session["collected"]:
         return handle_user_registration(user_input, session)
     
@@ -511,22 +527,22 @@ def handle_input(user_input: str, session: Dict) -> tuple[str, Dict]:
 
 def handle_user_registration(user_input: str, session: Dict) -> tuple[str, Dict]:
     """Handle user registration flow with validation"""
-    if not session["name"]:
-        session["name"] = user_input.strip()
+        if not session["name"]:
+            session["name"] = user_input.strip()
         return "Thank you! 📱 May I have your phone number?", session
-    elif not session["phone"]:
+        elif not session["phone"]:
         if not user_data_manager.validate_phone(user_input):
             return "Please enter a valid phone number (at least 10 digits).", session
-        session["phone"] = user_input.strip()
+            session["phone"] = user_input.strip()
         return "Great! 📧 May I have your email address?", session
-    elif not session["email"]:
+        elif not session["email"]:
         if not user_data_manager.validate_email(user_input):
             return "Please enter a valid email address.", session
-        session["email"] = user_input.strip()
+            session["email"] = user_input.strip()
         return "Thank you! 🌍 May I know your location?", session
-    elif not session["location"]:
-        session["location"] = user_input.strip()
-        session["collected"] = True
+        elif not session["location"]:
+            session["location"] = user_input.strip()
+            session["collected"] = True
         if user_data_manager.save_user_info(session):
             return (
                 f"Awesome, {session['name']} from {session['location']}! 🎉\n\n"
@@ -570,15 +586,15 @@ def handle_special_commands(user_input: str, session: Dict) -> tuple[str, Dict]:
         return response, session
     
     elif command == '/stats':
-        return (
+            return (
             f"📊 **Conversation Statistics:**\n\n"
             f"• Session ID: {session['session_id']}\n"
             f"• Interactions: {session['interaction_count']}\n"
             f"• Session Duration: {calculate_session_duration(session)}\n"
             f"• User: {session.get('name', 'Anonymous')}\n"
             f"• Location: {session.get('location', 'Unknown')}"
-        ), session
-    
+            ), session
+
     elif command == '/export chat':
         return export_conversation(session), session
     
@@ -642,9 +658,9 @@ def export_conversation(session: Dict) -> str:
 def on_submit(user_message: str, chat_history: List, state: Dict) -> tuple[str, List, Dict]:
     """Enhanced submit handler with better error handling"""
     try:
-        response, state = handle_input(user_message, state)
-        chat_history.append([user_message, response])
-        return "", chat_history, state
+    response, state = handle_input(user_message, state)
+    chat_history.append([user_message, response])
+    return "", chat_history, state
     except Exception as e:
         error_msg = f"An error occurred: {str(e)}"
         chat_history.append([user_message, error_msg])
