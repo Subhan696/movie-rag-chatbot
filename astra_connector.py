@@ -1,24 +1,22 @@
 """
 DataStax Astra Database Connector for Movie RAG Chatbot
-Handles fetching movie data from Astra database
+Handles fetching movie data from Astra database using REST API
 """
 
 import os
 import json
 import time
+import requests
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
-from cassandra.cluster import Cluster
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.query import SimpleStatement
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AstraConnector:
-    """Connector class for DataStax Astra database"""
+    """Connector class for DataStax Astra database using REST API"""
     
     def __init__(self, 
                  secure_connect_bundle_path: str,
@@ -36,59 +34,88 @@ class AstraConnector:
             keyspace: Database keyspace name
             table_name: Table name containing movie data
         """
-        self.secure_connect_bundle_path = secure_connect_bundle_path
         self.client_id = client_id
         self.client_secret = client_secret
         self.keyspace = keyspace
         self.table_name = table_name
-        self.session = None
-        self.cluster = None
         
-        # Initialize connection
-        self._connect()
+        # Extract database ID and region from secure connect bundle path
+        self.db_id, self.db_region = self._extract_db_info(secure_connect_bundle_path)
+        
+        # Check if we have valid configuration
+        if not self.db_id or not self.db_region:
+            logger.error("❌ Astra configuration incomplete")
+            logger.info("📝 Please run: python test_astra_setup.py")
+            self.base_url = None
+            self.access_token = None
+            self.headers = None
+            return
+        
+        # Build REST API URL
+        self.base_url = f"https://{self.db_id}-{self.db_region}.apps.astra.datastax.com/api/rest/v2/keyspaces/{self.keyspace}/{self.table_name}"
+        
+        # Get access token
+        self.access_token = self._get_access_token()
+        
+        # Headers for API requests
+        self.headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.access_token}',
+            'X-Cassandra-Token': self.access_token
+        }
     
-    def _connect(self):
-        """Establish connection to Astra database"""
+    def _extract_db_info(self, bundle_path: str) -> tuple:
+        """Extract database ID and region from secure connect bundle path"""
+        # Get database info from environment variables
+        db_id = os.getenv("ASTRA_DB_ID")
+        db_region = os.getenv("ASTRA_DB_REGION")
+        
+        if not db_id or db_id == "your-db-id":
+            logger.warning("⚠️ ASTRA_DB_ID not set or using placeholder value")
+            logger.info("📝 Please set ASTRA_DB_ID in your .env file")
+            return None, None
+            
+        if not db_region or db_region == "us-east1":
+            logger.warning("⚠️ ASTRA_DB_REGION not set or using default value")
+            logger.info("📝 Please set ASTRA_DB_REGION in your .env file")
+            return None, None
+            
+        return db_id, db_region
+    
+    def _get_access_token(self) -> str:
+        """Get access token from Astra"""
         try:
-            # Create auth provider
-            auth_provider = PlainTextAuthProvider(
-                username=self.client_id,
-                password=self.client_secret
-            )
-            
-            # Create cluster
-            self.cluster = Cluster(
-                cloud={'secure_connect_bundle': self.secure_connect_bundle_path},
-                auth_provider=auth_provider
-            )
-            
-            # Create session
-            self.session = self.cluster.connect()
-            
-            # Set keyspace
-            self.session.set_keyspace(self.keyspace)
-            
-            logger.info("✅ Astra connection successful")
-            
+            # For now, we'll use the client secret as token
+            # In production, you'd implement proper OAuth flow
+            return self.client_secret
         except Exception as e:
-            logger.error(f"❌ Astra connection failed: {e}")
+            logger.error(f"❌ Error getting access token: {e}")
             raise
     
     def test_connection(self) -> bool:
         """Test connection to Astra database"""
         try:
-            if not self.session:
+            # Check if configuration is valid
+            if not self.base_url or not self.headers:
+                logger.error("❌ Astra configuration not set up properly")
+                logger.info("📝 Please run: python test_astra_setup.py")
                 return False
             
-            # Simple query to test connection
-            query = f"SELECT COUNT(*) FROM {self.table_name} LIMIT 1"
-            result = self.session.execute(query)
-            
-            logger.info("✅ Astra connection test successful")
-            return True
-            
+            # Use GET with query parameters (where clause required)
+            params = {
+                'where': '{}',  # Empty where clause as JSON string
+                'limit': 1
+            }
+            response = requests.get(self.base_url, headers=self.headers, params=params)
+            if response.status_code == 200:
+                logger.info("✅ Astra connection successful")
+                return True
+            else:
+                logger.error(f"❌ Astra connection failed: {response.status_code}")
+                logger.error(f"   Response: {response.text}")
+                return False
         except Exception as e:
-            logger.error(f"❌ Astra connection test failed: {e}")
+            logger.error(f"❌ Astra connection error: {e}")
             return False
     
     def get_all_movies(self, limit: int = 1000) -> List[Dict]:
@@ -102,31 +129,43 @@ class AstraConnector:
             List of movie dictionaries
         """
         try:
-            query = f"SELECT * FROM {self.table_name} LIMIT {limit}"
-            result = self.session.execute(query)
+            # Use GET with query parameters
+            params = {
+                'where': '{}',  # Empty where clause as JSON string
+                'limit': limit
+            }
             
-            movies = []
-            for row in result:
-                movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None),
-                    'created_at': getattr(row, 'created_at', None),
-                    'updated_at': getattr(row, 'updated_at', None)
-                }
-                movies.append(movie)
+            response = requests.get(self.base_url, headers=self.headers, params=params)
             
-            logger.info(f"✅ Fetched {len(movies)} movies from Astra")
-            return movies
-            
+            if response.status_code == 200:
+                data = response.json()
+                movies = []
+                
+                for row in data.get('data', []):
+                    movie = {
+                        'Movie Name': row.get('title', 'Unknown'),
+                        'Year': row.get('year', 0),
+                        'Description': row.get('description', 'No description available'),
+                        'Director': row.get('director', 'Unknown'),
+                        'Cast': row.get('cast', 'Unknown'),
+                        'Genre': row.get('genre', 'Unknown'),
+                        'Box Office': row.get('box_office', 'Unknown'),
+                        'IMDb Rating': row.get('rating', 0.0),
+                        'Streaming': row.get('streaming', 'Unknown'),
+                        'Runtime (min)': row.get('runtime', 0),
+                        'id': row.get('id'),
+                        'created_at': row.get('created_at'),
+                        'updated_at': row.get('updated_at')
+                    }
+                    movies.append(movie)
+                
+                logger.info(f"✅ Fetched {len(movies)} movies from Astra")
+                return movies
+            else:
+                logger.error(f"❌ Failed to fetch movies: {response.status_code}")
+                logger.error(f"   Response: {response.text}")
+                return []
+                
         except Exception as e:
             logger.error(f"❌ Error fetching movies from Astra: {e}")
             return []
@@ -143,39 +182,49 @@ class AstraConnector:
             List of matching movies
         """
         try:
-            # Using LIKE for text search (you might want to use Solr/Elasticsearch for better search)
-            search_query = f"""
-                SELECT * FROM {self.table_name} 
-                WHERE title CONTAINS %s 
-                   OR description CONTAINS %s 
-                   OR director CONTAINS %s 
-                   OR cast CONTAINS %s 
-                   OR genre CONTAINS %s 
-                LIMIT {limit}
-            """
+            # Simple search using where clause
+            search_query = {
+                "where": {
+                    "$or": [
+                        {"title": {"$contains": query}},
+                        {"description": {"$contains": query}},
+                        {"director": {"$contains": query}},
+                        {"cast": {"$contains": query}},
+                        {"genre": {"$contains": query}}
+                    ]
+                },
+                "limit": limit
+            }
             
-            result = self.session.execute(search_query, (query, query, query, query, query))
+            url = f"{self.base_url}/search"
+            response = requests.post(url, headers=self.headers, json=search_query)
             
-            movies = []
-            for row in result:
-                movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None)
-                }
-                movies.append(movie)
-            
-            logger.info(f"✅ Found {len(movies)} movies matching '{query}'")
-            return movies
-            
+            if response.status_code == 200:
+                data = response.json()
+                movies = []
+                
+                for row in data.get('data', []):
+                    movie = {
+                        'Movie Name': row.get('title', 'Unknown'),
+                        'Year': row.get('year', 0),
+                        'Description': row.get('description', 'No description available'),
+                        'Director': row.get('director', 'Unknown'),
+                        'Cast': row.get('cast', 'Unknown'),
+                        'Genre': row.get('genre', 'Unknown'),
+                        'Box Office': row.get('box_office', 'Unknown'),
+                        'IMDb Rating': row.get('rating', 0.0),
+                        'Streaming': row.get('streaming', 'Unknown'),
+                        'Runtime (min)': row.get('runtime', 0),
+                        'id': row.get('id')
+                    }
+                    movies.append(movie)
+                
+                logger.info(f"✅ Found {len(movies)} movies matching '{query}'")
+                return movies
+            else:
+                logger.error(f"❌ Search failed: {response.status_code}")
+                return []
+                
         except Exception as e:
             logger.error(f"❌ Error searching movies: {e}")
             return []
@@ -191,23 +240,25 @@ class AstraConnector:
             Movie data or None if not found
         """
         try:
-            query = f"SELECT * FROM {self.table_name} WHERE id = %s"
-            result = self.session.execute(query, (movie_id,))
+            url = f"{self.base_url}/{movie_id}"
+            response = requests.get(url, headers=self.headers)
             
-            row = result.one()
-            if row:
+            if response.status_code == 200:
+                data = response.json()
+                row = data.get('data', {})
+                
                 movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None)
+                    'Movie Name': row.get('title', 'Unknown'),
+                    'Year': row.get('year', 0),
+                    'Description': row.get('description', 'No description available'),
+                    'Director': row.get('director', 'Unknown'),
+                    'Cast': row.get('cast', 'Unknown'),
+                    'Genre': row.get('genre', 'Unknown'),
+                    'Box Office': row.get('box_office', 'Unknown'),
+                    'IMDb Rating': row.get('rating', 0.0),
+                    'Streaming': row.get('streaming', 'Unknown'),
+                    'Runtime (min)': row.get('runtime', 0),
+                    'id': row.get('id')
                 }
                 return movie
             
@@ -229,35 +280,41 @@ class AstraConnector:
             List of movies in the specified genre
         """
         try:
-            query = f"""
-                SELECT * FROM {self.table_name} 
-                WHERE genre CONTAINS %s 
-                ORDER BY rating DESC 
-                LIMIT {limit}
-            """
+            search_query = {
+                "where": {"genre": {"$contains": genre}},
+                "orderBy": [{"column": "rating", "order": "desc"}],
+                "limit": limit
+            }
             
-            result = self.session.execute(query, (genre,))
+            url = f"{self.base_url}/search"
+            response = requests.post(url, headers=self.headers, json=search_query)
             
-            movies = []
-            for row in result:
-                movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None)
-                }
-                movies.append(movie)
-            
-            logger.info(f"✅ Found {len(movies)} movies in genre '{genre}'")
-            return movies
-            
+            if response.status_code == 200:
+                data = response.json()
+                movies = []
+                
+                for row in data.get('data', []):
+                    movie = {
+                        'Movie Name': row.get('title', 'Unknown'),
+                        'Year': row.get('year', 0),
+                        'Description': row.get('description', 'No description available'),
+                        'Director': row.get('director', 'Unknown'),
+                        'Cast': row.get('cast', 'Unknown'),
+                        'Genre': row.get('genre', 'Unknown'),
+                        'Box Office': row.get('box_office', 'Unknown'),
+                        'IMDb Rating': row.get('rating', 0.0),
+                        'Streaming': row.get('streaming', 'Unknown'),
+                        'Runtime (min)': row.get('runtime', 0),
+                        'id': row.get('id')
+                    }
+                    movies.append(movie)
+                
+                logger.info(f"✅ Found {len(movies)} movies in genre '{genre}'")
+                return movies
+            else:
+                logger.error(f"❌ Genre filter failed: {response.status_code}")
+                return []
+                
         except Exception as e:
             logger.error(f"❌ Error filtering by genre: {e}")
             return []
@@ -273,34 +330,40 @@ class AstraConnector:
             List of top-rated movies
         """
         try:
-            query = f"""
-                SELECT * FROM {self.table_name} 
-                ORDER BY rating DESC 
-                LIMIT {limit}
-            """
+            search_query = {
+                "orderBy": [{"column": "rating", "order": "desc"}],
+                "limit": limit
+            }
             
-            result = self.session.execute(query)
+            url = f"{self.base_url}/search"
+            response = requests.post(url, headers=self.headers, json=search_query)
             
-            movies = []
-            for row in result:
-                movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None)
-                }
-                movies.append(movie)
-            
-            logger.info(f"✅ Fetched {len(movies)} top-rated movies")
-            return movies
-            
+            if response.status_code == 200:
+                data = response.json()
+                movies = []
+                
+                for row in data.get('data', []):
+                    movie = {
+                        'Movie Name': row.get('title', 'Unknown'),
+                        'Year': row.get('year', 0),
+                        'Description': row.get('description', 'No description available'),
+                        'Director': row.get('director', 'Unknown'),
+                        'Cast': row.get('cast', 'Unknown'),
+                        'Genre': row.get('genre', 'Unknown'),
+                        'Box Office': row.get('box_office', 'Unknown'),
+                        'IMDb Rating': row.get('rating', 0.0),
+                        'Streaming': row.get('streaming', 'Unknown'),
+                        'Runtime (min)': row.get('runtime', 0),
+                        'id': row.get('id')
+                    }
+                    movies.append(movie)
+                
+                logger.info(f"✅ Fetched {len(movies)} top-rated movies")
+                return movies
+            else:
+                logger.error(f"❌ Top rated query failed: {response.status_code}")
+                return []
+                
         except Exception as e:
             logger.error(f"❌ Error fetching top rated movies: {e}")
             return []
@@ -317,35 +380,41 @@ class AstraConnector:
             List of movies from the specified year
         """
         try:
-            query = f"""
-                SELECT * FROM {self.table_name} 
-                WHERE year = %s 
-                ORDER BY rating DESC 
-                LIMIT {limit}
-            """
+            search_query = {
+                "where": {"year": {"$eq": year}},
+                "orderBy": [{"column": "rating", "order": "desc"}],
+                "limit": limit
+            }
             
-            result = self.session.execute(query, (year,))
+            url = f"{self.base_url}/search"
+            response = requests.post(url, headers=self.headers, json=search_query)
             
-            movies = []
-            for row in result:
-                movie = {
-                    'Movie Name': getattr(row, 'title', 'Unknown'),
-                    'Year': getattr(row, 'year', 0),
-                    'Description': getattr(row, 'description', 'No description available'),
-                    'Director': getattr(row, 'director', 'Unknown'),
-                    'Cast': getattr(row, 'cast', 'Unknown'),
-                    'Genre': getattr(row, 'genre', 'Unknown'),
-                    'Box Office': getattr(row, 'box_office', 'Unknown'),
-                    'IMDb Rating': getattr(row, 'rating', 0.0),
-                    'Streaming': getattr(row, 'streaming', 'Unknown'),
-                    'Runtime (min)': getattr(row, 'runtime', 0),
-                    'id': getattr(row, 'id', None)
-                }
-                movies.append(movie)
-            
-            logger.info(f"✅ Found {len(movies)} movies from year {year}")
-            return movies
-            
+            if response.status_code == 200:
+                data = response.json()
+                movies = []
+                
+                for row in data.get('data', []):
+                    movie = {
+                        'Movie Name': row.get('title', 'Unknown'),
+                        'Year': row.get('year', 0),
+                        'Description': row.get('description', 'No description available'),
+                        'Director': row.get('director', 'Unknown'),
+                        'Cast': row.get('cast', 'Unknown'),
+                        'Genre': row.get('genre', 'Unknown'),
+                        'Box Office': row.get('box_office', 'Unknown'),
+                        'IMDb Rating': row.get('rating', 0.0),
+                        'Streaming': row.get('streaming', 'Unknown'),
+                        'Runtime (min)': row.get('runtime', 0),
+                        'id': row.get('id')
+                    }
+                    movies.append(movie)
+                
+                logger.info(f"✅ Found {len(movies)} movies from year {year}")
+                return movies
+            else:
+                logger.error(f"❌ Year filter failed: {response.status_code}")
+                return []
+                
         except Exception as e:
             logger.error(f"❌ Error filtering by year: {e}")
             return []
@@ -359,66 +428,30 @@ class AstraConnector:
         """
         try:
             # Get total count
-            count_query = f"SELECT COUNT(*) as total FROM {self.table_name}"
-            count_result = self.session.execute(count_query)
-            total_count = count_result.one().total
+            url = f"{self.base_url}?limit=1"
+            response = requests.get(url, headers=self.headers)
             
-            # Get genre distribution
-            genre_query = f"SELECT genre, COUNT(*) as count FROM {self.table_name} GROUP BY genre"
-            genre_result = self.session.execute(genre_query)
-            
-            genres = {}
-            for row in genre_result:
-                genres[getattr(row, 'genre', 'Unknown')] = getattr(row, 'count', 0)
-            
-            # Get year distribution
-            year_query = f"SELECT year, COUNT(*) as count FROM {self.table_name} GROUP BY year ORDER BY year DESC"
-            year_result = self.session.execute(year_query)
-            
-            years = {}
-            for row in year_result:
-                years[getattr(row, 'year', 0)] = getattr(row, 'count', 0)
-            
-            return {
-                'total_movies': total_count,
-                'genres': genres,
-                'years': years,
-                'last_updated': datetime.now().isoformat()
-            }
-            
+            if response.status_code == 200:
+                data = response.json()
+                total_count = len(data.get('data', []))
+                
+                # For now, return basic stats
+                # In a real implementation, you'd aggregate the data
+                stats = {
+                    'total_movies': total_count,
+                    'genres': {'Unknown': total_count},  # Placeholder
+                    'years': {2024: total_count},  # Placeholder
+                    'last_updated': datetime.now().isoformat(),
+                    'data_source': 'astra_rest_api'
+                }
+                
+                return stats
+            else:
+                return {'error': f'Failed to get statistics: {response.status_code}'}
+                
         except Exception as e:
             logger.error(f"❌ Error getting statistics: {e}")
             return {'error': str(e)}
-    
-    def create_movie_table(self):
-        """
-        Create the movies table if it doesn't exist
-        This is a helper method for setting up the database schema
-        """
-        try:
-            create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {self.keyspace}.{self.table_name} (
-                    id uuid PRIMARY KEY,
-                    title text,
-                    year int,
-                    description text,
-                    director text,
-                    cast text,
-                    genre text,
-                    box_office text,
-                    rating decimal,
-                    streaming text,
-                    runtime int,
-                    created_at timestamp,
-                    updated_at timestamp
-                )
-            """
-            
-            self.session.execute(create_table_query)
-            logger.info(f"✅ Created table {self.table_name}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error creating table: {e}")
     
     def insert_movie(self, movie_data: Dict) -> bool:
         """
@@ -432,61 +465,69 @@ class AstraConnector:
         """
         try:
             from uuid import uuid4
-            from datetime import datetime
             
-            insert_query = f"""
-                INSERT INTO {self.table_name} (
-                    id, title, year, description, director, cast, 
-                    genre, box_office, rating, streaming, runtime, 
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
+            insert_data = {
+                'id': str(uuid4()),
+                'title': movie_data.get('title', ''),
+                'year': movie_data.get('year', 0),
+                'description': movie_data.get('description', ''),
+                'director': movie_data.get('director', ''),
+                'cast': movie_data.get('cast', ''),
+                'genre': movie_data.get('genre', ''),
+                'box_office': movie_data.get('box_office', ''),
+                'rating': movie_data.get('rating', 0.0),
+                'streaming': movie_data.get('streaming', ''),
+                'runtime': movie_data.get('runtime', 0),
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat()
+            }
             
-            now = datetime.now()
+            response = requests.post(self.base_url, headers=self.headers, json=insert_data)
             
-            self.session.execute(insert_query, (
-                uuid4(),
-                movie_data.get('title', ''),
-                movie_data.get('year', 0),
-                movie_data.get('description', ''),
-                movie_data.get('director', ''),
-                movie_data.get('cast', ''),
-                movie_data.get('genre', ''),
-                movie_data.get('box_office', ''),
-                movie_data.get('rating', 0.0),
-                movie_data.get('streaming', ''),
-                movie_data.get('runtime', 0),
-                now,
-                now
-            ))
-            
-            logger.info(f"✅ Inserted movie: {movie_data.get('title', 'Unknown')}")
-            return True
-            
+            if response.status_code == 201:
+                logger.info(f"✅ Inserted movie: {movie_data.get('title', 'Unknown')}")
+                return True
+            else:
+                logger.error(f"❌ Failed to insert movie: {response.status_code}")
+                return False
+                
         except Exception as e:
             logger.error(f"❌ Error inserting movie: {e}")
             return False
     
     def close(self):
-        """Close the database connection"""
-        try:
-            if self.session:
-                self.session.shutdown()
-            if self.cluster:
-                self.cluster.shutdown()
-            logger.info("✅ Astra connection closed")
-        except Exception as e:
-            logger.error(f"❌ Error closing connection: {e}")
+        """Close the database connection (no-op for REST API)"""
+        logger.info("✅ Astra REST API connection closed")
 
 # Example usage and testing
 if __name__ == "__main__":
+    # Test the connector with environment variables
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
+    # Get configuration from environment
+    db_id = os.getenv("ASTRA_DB_ID")
+    db_region = os.getenv("ASTRA_DB_REGION")
+    client_id = os.getenv("ASTRA_CLIENT_ID")
+    client_secret = os.getenv("ASTRA_CLIENT_SECRET")
+    keyspace = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+    table_name = os.getenv("ASTRA_TABLE_NAME", "ragcine")
+    
+    if not all([db_id, db_region, client_id, client_secret]):
+        print("❌ Missing Astra configuration")
+        print("📝 Please set up your .env file with Astra credentials")
+        print("📝 Run: python test_astra_setup.py")
+        exit(1)
+    
     # Test the connector
     connector = AstraConnector(
-        secure_connect_bundle_path="path/to/secure-connect-database.zip",
-        client_id="your_client_id",
-        client_secret="your_client_secret",
-        keyspace="movies",
-        table_name="movies"
+        secure_connect_bundle_path="dummy",  # Not used in REST API
+        client_id=client_id,
+        client_secret=client_secret,
+        keyspace=keyspace,
+        table_name=table_name
     )
     
     # Test connection

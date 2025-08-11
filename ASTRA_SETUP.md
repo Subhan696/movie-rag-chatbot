@@ -1,11 +1,11 @@
-# 🚀 DataStax Astra Database Integration Guide
+# 🚀 DataStax Astra Database Integration Guide (REST API)
 
-This guide will help you set up and integrate your DataStax Astra database with the enhanced Movie RAG Chatbot.
+This guide will help you set up and integrate your DataStax Astra database with the enhanced Movie RAG Chatbot using the REST API approach.
 
 ## 📋 Prerequisites
 
 - DataStax Astra account (free tier available)
-- Python 3.8+
+- Python 3.8+ (including Python 3.13)
 - Movie data in your Astra database
 
 ## 🎯 Step 1: Set Up DataStax Astra
@@ -21,8 +21,11 @@ This guide will help you set up and integrate your DataStax Astra database with 
 
 ### 1.2 Get Connection Details
 1. In your Astra dashboard, go to "Connect"
-2. Download the **Secure Connect Bundle** (ZIP file)
-3. Note your **Client ID** and **Client Secret**
+2. Note your **Database ID** and **Region** from the connection details
+3. Create an **Application Token**:
+   - Go to "Settings" → "Application Tokens"
+   - Click "Generate Token"
+   - Save the **Client ID** and **Client Secret**
 4. Save these credentials securely
 
 ### 1.3 Create Movie Table
@@ -49,7 +52,7 @@ CREATE TABLE IF NOT EXISTS movies.movies (
 ## 🎯 Step 2: Install Dependencies
 
 ```bash
-# Install the required packages
+# Install the required packages (no Cassandra driver needed!)
 pip install -r requirements.txt
 ```
 
@@ -61,10 +64,11 @@ Create a `.env` file in your project root:
 # Gemini API
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# Astra Database Configuration
-ASTRA_SECURE_CONNECT_BUNDLE=path/to/secure-connect-database.zip
-ASTRA_CLIENT_ID=your_astra_client_id
-ASTRA_CLIENT_SECRET=your_astra_client_secret
+# Astra Database Configuration (REST API)
+ASTRA_DB_ID=your_database_id_here
+ASTRA_DB_REGION=your_region_here
+ASTRA_CLIENT_ID=your_client_id_here
+ASTRA_CLIENT_SECRET=your_client_secret_here
 ASTRA_KEYSPACE=movies
 ASTRA_TABLE_NAME=movies
 
@@ -90,7 +94,7 @@ load_dotenv()
 def load_movies_to_astra():
     # Initialize Astra connector
     connector = AstraConnector(
-        secure_connect_bundle_path=os.getenv("ASTRA_SECURE_CONNECT_BUNDLE"),
+        secure_connect_bundle_path="dummy",  # Not used in REST API
         client_id=os.getenv("ASTRA_CLIENT_ID"),
         client_secret=os.getenv("ASTRA_CLIENT_SECRET"),
         keyspace=os.getenv("ASTRA_KEYSPACE", "movies"),
@@ -132,22 +136,30 @@ if __name__ == "__main__":
     load_movies_to_astra()
 ```
 
-### Option B: Using CQL Commands
+### Option B: Using REST API Directly
 
-You can also insert data directly using CQL:
+You can also insert data using the REST API:
 
-```sql
-INSERT INTO movies.movies (
-    id, title, year, description, director, cast, 
-    genre, box_office, rating, streaming, runtime, 
-    created_at, updated_at
-) VALUES (
-    uuid(), 'The Shawshank Redemption', 1994, 
-    'Two imprisoned men bond over a number of years...',
-    'Frank Darabont', 'Tim Robbins, Morgan Freeman',
-    'Drama', '$58.3M', 9.3, 'Netflix', 142,
-    toTimestamp(now()), toTimestamp(now())
-);
+```bash
+# Example using curl
+curl -X POST "https://your-db-id-your-region.apps.astra.datastax.com/api/rest/v2/keyspaces/movies/movies" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_client_secret" \
+  -d '{
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "title": "The Shawshank Redemption",
+    "year": 1994,
+    "description": "Two imprisoned men bond over a number of years...",
+    "director": "Frank Darabont",
+    "cast": "Tim Robbins, Morgan Freeman",
+    "genre": "Drama",
+    "box_office": "$58.3M",
+    "rating": 9.3,
+    "streaming": "Netflix",
+    "runtime": 142,
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-01T00:00:00Z"
+  }'
 ```
 
 ## 🎯 Step 5: Test the Integration
@@ -192,9 +204,8 @@ python movie_chatbot.py
    # Check your credentials
    echo $ASTRA_CLIENT_ID
    echo $ASTRA_CLIENT_SECRET
-   
-   # Verify secure connect bundle exists
-   ls -la secure-connect-database.zip
+   echo $ASTRA_DB_ID
+   echo $ASTRA_DB_REGION
    ```
 
 2. **Table Not Found**
@@ -217,25 +228,17 @@ python movie_chatbot.py
    ```
 
 4. **Permission Denied**
-   - Check if your Astra user has the correct permissions
+   - Check if your Application Token has the correct permissions
    - Ensure you're using the right keyspace
 
 ## 📊 Performance Optimization
 
-### 1. Indexing for Better Search
+### 1. REST API Best Practices
 
-Create secondary indexes for better performance:
-
-```sql
--- Index for genre searches
-CREATE INDEX ON movies.movies (genre);
-
--- Index for year searches
-CREATE INDEX ON movies.movies (year);
-
--- Index for rating searches
-CREATE INDEX ON movies.movies (rating);
-```
+- Use appropriate HTTP methods (GET, POST, PUT, DELETE)
+- Implement proper error handling
+- Use pagination for large datasets
+- Cache frequently accessed data
 
 ### 2. Batch Operations
 
@@ -245,39 +248,45 @@ For large datasets, use batch operations:
 def batch_insert_movies(movies_data, batch_size=100):
     for i in range(0, len(movies_data), batch_size):
         batch = movies_data[i:i + batch_size]
-        # Insert batch
+        # Insert batch using REST API
         time.sleep(0.1)  # Rate limiting
 ```
 
-### 3. Connection Pooling
+### 3. Connection Management
 
-The Cassandra driver automatically handles connection pooling, but you can configure it:
+The REST API approach doesn't require connection pooling, but you can optimize:
 
 ```python
-from cassandra.cluster import Cluster
-from cassandra.policies import DCAwareRoundRobinPolicy
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-cluster = Cluster(
-    cloud={'secure_connect_bundle': bundle_path},
-    auth_provider=auth_provider,
-    load_balancing_policy=DCAwareRoundRobinPolicy(local_dc='default'),
-    protocol_version=4
+# Configure retry strategy
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
 )
+
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session = requests.Session()
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 ```
 
 ## 🔒 Security Best Practices
 
 1. **Environment Variables**: Never hardcode credentials
-2. **Secure Connect Bundle**: Keep it secure and don't commit to version control
-3. **Network Security**: Use Astra's built-in security features
-4. **Access Control**: Use least-privilege access for your database user
+2. **Application Tokens**: Use least-privilege access
+3. **Network Security**: Use HTTPS for all API calls
+4. **Token Rotation**: Regularly rotate your application tokens
 
 ## 📈 Monitoring and Analytics
 
 ### 1. Astra Metrics
 - Monitor your database usage in the Astra dashboard
 - Set up alerts for high usage
-- Track query performance
+- Track API request performance
 
 ### 2. Application Metrics
 ```python
@@ -295,7 +304,8 @@ print(f"Query took {query_time:.2f} seconds")
 ### 1. Environment Setup
 ```bash
 # Production environment variables
-export ASTRA_SECURE_CONNECT_BUNDLE=/app/secure-connect-database.zip
+export ASTRA_DB_ID=prod_db_id
+export ASTRA_DB_REGION=prod_region
 export ASTRA_CLIENT_ID=prod_client_id
 export ASTRA_CLIENT_SECRET=prod_client_secret
 export DATA_SOURCE=astra
@@ -303,9 +313,11 @@ export DATA_SOURCE=astra
 
 ### 2. Docker Configuration
 ```dockerfile
-# Copy secure connect bundle
-COPY secure-connect-database.zip /app/
-ENV ASTRA_SECURE_CONNECT_BUNDLE=/app/secure-connect-database.zip
+# No need for secure connect bundle
+ENV ASTRA_DB_ID=your_db_id
+ENV ASTRA_DB_REGION=your_region
+ENV ASTRA_CLIENT_ID=your_client_id
+ENV ASTRA_CLIENT_SECRET=your_client_secret
 ```
 
 ### 3. Health Checks
@@ -329,17 +341,19 @@ def health_check():
 ## 📞 Support
 
 - **Astra Documentation**: [docs.datastax.com](https://docs.datastax.com/)
+- **Astra REST API Docs**: [docs.datastax.com/en/astra/docs/rest-api.html](https://docs.datastax.com/en/astra/docs/rest-api.html)
 - **Astra Community**: [community.datastax.com](https://community.datastax.com/)
 - **GitHub Issues**: Create an issue in this repository
 
 ---
 
-**🎉 Congratulations!** Your Movie RAG Chatbot is now powered by DataStax Astra! 
+**🎉 Congratulations!** Your Movie RAG Chatbot is now powered by DataStax Astra using REST API! 
 
 The combination of Astra's scalable database with the enhanced RAG capabilities will provide:
-- **Better Performance**: Fast, scalable database queries
+- **Better Performance**: Fast, scalable REST API queries
 - **Real-time Data**: Live updates to your movie database
 - **Reliability**: Astra's cloud-native architecture
 - **Scalability**: Handle millions of movies and users
+- **Python 3.13 Compatibility**: No more Cassandra driver issues!
 
 Happy coding! 🎬✨

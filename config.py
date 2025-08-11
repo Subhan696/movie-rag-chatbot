@@ -22,8 +22,10 @@ class Config:
     ASTRA_SECURE_CONNECT_BUNDLE = os.getenv("ASTRA_SECURE_CONNECT_BUNDLE", "secure-connect-database.zip")
     ASTRA_CLIENT_ID = os.getenv("ASTRA_CLIENT_ID")
     ASTRA_CLIENT_SECRET = os.getenv("ASTRA_CLIENT_SECRET")
-    ASTRA_KEYSPACE = os.getenv("ASTRA_KEYSPACE", "movies")
-    ASTRA_TABLE_NAME = os.getenv("ASTRA_TABLE_NAME", "movies")
+    ASTRA_KEYSPACE = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+    ASTRA_TABLE_NAME = os.getenv("ASTRA_TABLE_NAME", "ragcine")
+    ASTRA_DB_ID = os.getenv("ASTRA_DB_ID", "your-db-id")
+    ASTRA_DB_REGION = os.getenv("ASTRA_DB_REGION", "us-east1")
     
     # Data Source Configuration
     DATA_SOURCE = os.getenv("DATA_SOURCE", "astra")  # Options: "astra", "excel", "strapi"
@@ -194,7 +196,9 @@ class Config:
             "client_id": cls.ASTRA_CLIENT_ID,
             "client_secret": cls.ASTRA_CLIENT_SECRET,
             "keyspace": cls.ASTRA_KEYSPACE,
-            "table_name": cls.ASTRA_TABLE_NAME
+            "table_name": cls.ASTRA_TABLE_NAME,
+            "db_id": cls.ASTRA_DB_ID,
+            "db_region": cls.ASTRA_DB_REGION
         }
     
     @classmethod
