@@ -11,6 +11,7 @@ import json
 import time
 from datetime import datetime
 import re
+import requests
 from typing import List, Dict, Any, Optional
 
 # 🔷 Load Gemini API key
@@ -18,36 +19,160 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 📁 Paths
-MOVIE_PATH = r"H:\\Subhan\\Hollywood_Top_Movies.xlsx"
 EXCEL_FILE = "user_info.xlsx"
 CONVERSATION_LOG = "conversation_log.json"
 
-# 🔷 Enhanced Movie Data Processing
+# 🔷 Enhanced Movie Data Processing with Astra Vector Database
 class MovieDataProcessor:
-    def __init__(self, movie_path: str):
-        self.movie_path = movie_path
+    def __init__(self):
         self.df = None
         self.vectorizer = None
         self.movie_vectors = None
         self.movie_chunks = []
+        self.astra_connector = AstraConnector()
         self.load_and_process_data()
     
     def load_and_process_data(self):
-        """Load and process movie data with enhanced features"""
+        """Load and process movie data from Astra vector database"""
         try:
-            self.df = pd.read_excel(self.movie_path)
-            self.df = self.df.fillna("Unknown")
-            self.create_movie_chunks()
-            self.create_vector_embeddings()
+            # Try to load from Astra first
+            if self.astra_connector.test_connection():
+                print("✅ Connected to Astra vector database")
+                self.load_from_astra()
+            else:
+                print("⚠️ Astra connection failed, using sample data")
+                self.load_sample_data()
         except Exception as e:
-            print(f"Error loading movie data: {e}")
-            # Create sample data if file not found
-            self.df = self.create_sample_data()
-            self.create_movie_chunks()
-            self.create_vector_embeddings()
+            print(f"Error loading data: {e}")
+            self.load_sample_data()
     
-    def create_sample_data(self):
-        """Create sample movie data for testing"""
+    def load_from_astra(self):
+        """Load data from Astra vector database"""
+        try:
+            # Get all vector data
+            all_vectors = self.astra_connector.get_all_vectors(limit=1000)
+            if not all_vectors:
+                print("❌ No data found in Astra, using sample data")
+                self.load_sample_data()
+                return
+            
+            # Convert to DataFrame
+            self.df = pd.DataFrame(all_vectors)
+            print(f"✅ Loaded {len(self.df)} records from Astra")
+            
+            # Show what fields we have
+            print(f"📋 Available fields: {list(self.df.columns)}")
+            
+            # Show sample data
+            if len(self.df) > 0:
+                print("📊 Sample record:")
+                sample_row = self.df.iloc[0]
+                for key, value in sample_row.items():
+                    if isinstance(value, str) and len(value) > 100:
+                        print(f"  {key}: {value[:100]}...")
+                    else:
+                        print(f"  {key}: {value}")
+            
+            # Create chunks from vector data
+            self.create_chunks_from_vectors()
+            
+        except Exception as e:
+            print(f"Error loading from Astra: {e}")
+            self.load_sample_data()
+    
+    def create_chunks_from_vectors(self):
+        """Create searchable chunks from vector data"""
+        self.movie_chunks = []
+        
+        for _, row in self.df.iterrows():
+            # Extract text fields from vector records
+            text_fields = []
+            
+            # Look for common text fields - expanded list
+            text_field_names = [
+                'text', 'content', 'description', 'title', 'name', 'summary', 
+                'movie_name', 'movie_title', 'movie', 'film', 'plot', 'synopsis',
+                'director', 'cast', 'actors', 'genre', 'year', 'rating', 'imdb_rating',
+                'box_office', 'runtime', 'duration', 'streaming', 'platform'
+            ]
+            
+            for field in text_field_names:
+                if field in row and pd.notna(row[field]) and str(row[field]).strip():
+                    text_fields.append(str(row[field]))
+            
+            # If no text fields found, use ALL non-vector fields
+            if not text_fields:
+                for key, value in row.items():
+                    if (isinstance(value, str) and 
+                        ',' not in value and 
+                        len(value) < 2000 and  # Increased limit
+                        pd.notna(value) and 
+                        value.strip() and
+                        not key.lower().startswith('vector') and  # Skip vector fields
+                        not key.lower().startswith('embedding')):
+                        text_fields.append(f"{key}: {value}")
+            
+            # Create chunks from available text
+            if text_fields:
+                for text in text_fields:
+                    self.movie_chunks.append({
+                        'text': text,
+                        'movie_name': self.extract_movie_name(text),
+                        'year': self.extract_year(text),
+                        'genre': self.extract_genre(text),
+                        'rating': self.extract_rating(text),
+                        'original_record': row
+                    })
+        
+        print(f"✅ Created {len(self.movie_chunks)} searchable chunks")
+        
+        # Debug: Show what we found
+        if self.movie_chunks:
+            print("📋 Sample chunks created:")
+            for i, chunk in enumerate(self.movie_chunks[:3]):
+                print(f"  {i+1}. {chunk['text'][:100]}...")
+        else:
+            print("⚠️ No text chunks created - check your data structure")
+    
+    def extract_movie_name(self, text: str) -> str:
+        """Extract movie name from text"""
+        # Simple extraction - look for patterns
+        if 'Movie:' in text:
+            return text.split('Movie:')[1].split('(')[0].strip()
+        elif 'Title:' in text:
+            return text.split('Title:')[1].split('(')[0].strip()
+        else:
+            # Return first few words as potential title
+            words = text.split()[:3]
+            return ' '.join(words)
+    
+    def extract_year(self, text: str) -> int:
+        """Extract year from text"""
+        import re
+        year_match = re.search(r'\((\d{4})\)', text)
+        if year_match:
+            return int(year_match.group(1))
+        return 2000  # Default year
+    
+    def extract_genre(self, text: str) -> str:
+        """Extract genre from text"""
+        genres = ['action', 'drama', 'comedy', 'horror', 'sci-fi', 'romance', 'thriller']
+        text_lower = text.lower()
+        for genre in genres:
+            if genre in text_lower:
+                return genre.title()
+        return "Unknown"
+    
+    def extract_rating(self, text: str) -> float:
+        """Extract rating from text"""
+        import re
+        rating_match = re.search(r'(\d+\.?\d*)/10', text)
+        if rating_match:
+            return float(rating_match.group(1))
+        return 7.0  # Default rating
+    
+    def load_sample_data(self):
+        """Load sample data when Astra is not available"""
         sample_data = {
             'Movie Name': ['The Shawshank Redemption', 'The Godfather', 'Pulp Fiction'],
             'Year': [1994, 1972, 1994],
@@ -60,10 +185,12 @@ class MovieDataProcessor:
             'Streaming': ['Netflix', 'Amazon Prime', 'Hulu'],
             'Runtime (min)': [142, 175, 154]
         }
-        return pd.DataFrame(sample_data)
+        self.df = pd.DataFrame(sample_data)
+        self.create_movie_chunks()
+        self.create_vector_embeddings()
     
     def create_movie_chunks(self):
-        """Create searchable chunks from movie data"""
+        """Create searchable chunks from movie data (for sample data)"""
         self.movie_chunks = []
         for _, row in self.df.iterrows():
             # Create multiple chunks per movie for better retrieval
@@ -85,32 +212,96 @@ class MovieDataProcessor:
     
     def create_vector_embeddings(self):
         """Create TF-IDF vectors for semantic search"""
-        texts = [chunk['text'] for chunk in self.movie_chunks]
-        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-        self.movie_vectors = self.vectorizer.fit_transform(texts)
+        if self.movie_chunks:
+            texts = [chunk['text'] for chunk in self.movie_chunks]
+            self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+            self.movie_vectors = self.vectorizer.fit_transform(texts)
     
     def search_movies(self, query: str, top_k: int = 5) -> List[Dict]:
         """Search movies using semantic similarity"""
-        query_vector = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vector, self.movie_vectors).flatten()
-        top_indices = similarities.argsort()[-top_k:][::-1]
+        if not self.movie_chunks or not self.vectorizer:
+            return []
         
-        results = []
-        seen_movies = set()
-        for idx in top_indices:
-            chunk = self.movie_chunks[idx]
-            if chunk['movie_name'] not in seen_movies:
-                results.append({
-                    'movie_name': chunk['movie_name'],
-                    'year': chunk['year'],
-                    'genre': chunk['genre'],
-                    'rating': chunk['rating'],
-                    'relevance_score': float(similarities[idx]),
-                    'chunk_text': chunk['text']
-                })
-                seen_movies.add(chunk['movie_name'])
+        try:
+            query_vector = self.vectorizer.transform([query])
+            similarities = cosine_similarity(query_vector, self.movie_vectors).flatten()
+            top_indices = similarities.argsort()[-top_k:][::-1]
+            
+            results = []
+            seen_movies = set()
+            for idx in top_indices:
+                chunk = self.movie_chunks[idx]
+                if chunk['movie_name'] not in seen_movies:
+                    results.append({
+                        'movie_name': chunk['movie_name'],
+                        'year': chunk['year'],
+                        'genre': chunk['genre'],
+                        'rating': chunk['rating'],
+                        'relevance_score': float(similarities[idx]),
+                        'chunk_text': chunk['text']
+                    })
+                    seen_movies.add(chunk['movie_name'])
+            
+            return results
+        except Exception as e:
+            print(f"Error in search: {e}")
+            return []
+
+# 🔷 Astra Database Connector
+class AstraConnector:
+    """Connector for Astra Vector Database"""
+    
+    def __init__(self):
+        self.db_id = os.getenv("ASTRA_DB_ID")
+        self.db_region = os.getenv("ASTRA_DB_REGION")
+        self.client_secret = os.getenv("ASTRA_CLIENT_SECRET")
+        self.keyspace = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+        self.table_name = os.getenv("ASTRA_TABLE_NAME", "ragcine")
         
-        return results
+        if not all([self.db_id, self.db_region, self.client_secret]):
+            print("⚠️ Astra configuration incomplete")
+            self.base_url = None
+            self.headers = None
+            return
+        
+        self.base_url = f"https://{self.db_id}-{self.db_region}.apps.astra.datastax.com/api/rest/v2/keyspaces/{self.keyspace}/{self.table_name}"
+        self.headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.client_secret}',
+            'X-Cassandra-Token': self.client_secret
+        }
+    
+    def test_connection(self) -> bool:
+        """Test connection to Astra database"""
+        if not self.base_url or not self.headers:
+            return False
+        
+        try:
+            params = {'where': '{}', 'limit': 1}
+            response = requests.get(self.base_url, headers=self.headers, params=params, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ Astra connection error: {e}")
+            return False
+    
+    def get_all_vectors(self, limit: int = 1000) -> List[Dict]:
+        """Get all vector data from Astra"""
+        if not self.base_url or not self.headers:
+            return []
+        
+        try:
+            params = {'where': '{}', 'limit': limit}
+            response = requests.get(self.base_url, headers=self.headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', [])
+            else:
+                print(f"Failed to get vectors: {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Error getting vectors: {e}")
+            return []
 
 # 🔷 Enhanced Session Management
 class SessionManager:
@@ -237,7 +428,7 @@ class MovieRecommender:
         return genre_movies[:top_k]
 
 # 🔷 Initialize components
-movie_processor = MovieDataProcessor(MOVIE_PATH)
+movie_processor = MovieDataProcessor()
 session_manager = SessionManager()
 user_data_manager = UserDataManager(EXCEL_FILE)
 movie_recommender = MovieRecommender(movie_processor)
@@ -468,11 +659,11 @@ def on_export(state: Dict) -> str:
     return export_conversation(state)
 
 # 🔷 Enhanced Gradio app with better UI
-with gr.Blocks(theme=gr.themes.Soft(), title="Movie Expert Chatbot 🎬") as demo:
+with gr.Blocks(theme=gr.themes.Soft(), title="Vector Movie Expert Chatbot 🎬") as demo:
     gr.Markdown("""
-    # 🎬 Movie Expert Chatbot
+    # 🎬 Vector Movie Expert Chatbot
     
-    Your intelligent assistant for all things Hollywood movies! Ask about cast, directors, ratings, and get personalized recommendations.
+    Your intelligent assistant powered by Astra vector database! Ask about movies, and I'll search through your vector embeddings for the most relevant information.
     
     ---
     """)
