@@ -18,6 +18,16 @@ class Config:
     USER_INFO_FILE = "user_info.xlsx"
     CONVERSATION_LOG_FILE = "conversation_log.json"
     
+    # Astra Database Configuration
+    ASTRA_SECURE_CONNECT_BUNDLE = os.getenv("ASTRA_SECURE_CONNECT_BUNDLE", "secure-connect-database.zip")
+    ASTRA_CLIENT_ID = os.getenv("ASTRA_CLIENT_ID")
+    ASTRA_CLIENT_SECRET = os.getenv("ASTRA_CLIENT_SECRET")
+    ASTRA_KEYSPACE = os.getenv("ASTRA_KEYSPACE", "movies")
+    ASTRA_TABLE_NAME = os.getenv("ASTRA_TABLE_NAME", "movies")
+    
+    # Data Source Configuration
+    DATA_SOURCE = os.getenv("DATA_SOURCE", "astra")  # Options: "astra", "excel", "strapi"
+    
     # Search Configuration
     DEFAULT_SEARCH_RESULTS = 3
     MAX_SEARCH_RESULTS = 10
@@ -64,7 +74,8 @@ class Config:
         "api_error": "Sorry, I encountered an error while processing your request. Please try again later.",
         "data_error": "Sorry, I couldn't load the movie data. Please check the data source.",
         "validation_error": "Please provide valid information.",
-        "unknown_command": "Unknown command. Type /help for available commands."
+        "unknown_command": "Unknown command. Type /help for available commands.",
+        "database_error": "Sorry, I couldn't connect to the database. Please check your connection settings."
     }
     
     # Welcome Messages
@@ -91,7 +102,7 @@ class Config:
     Let's get started! 🍿
     """
     
-    # Sample Data (fallback when Excel file is not available)
+    # Sample Data (fallback when database is not available)
     SAMPLE_MOVIE_DATA = {
         'Movie Name': [
             'The Shawshank Redemption',
@@ -176,6 +187,17 @@ class Config:
         }
     
     @classmethod
+    def get_astra_config(cls) -> Dict[str, Any]:
+        """Get Astra database configuration"""
+        return {
+            "secure_connect_bundle_path": cls.ASTRA_SECURE_CONNECT_BUNDLE,
+            "client_id": cls.ASTRA_CLIENT_ID,
+            "client_secret": cls.ASTRA_CLIENT_SECRET,
+            "keyspace": cls.ASTRA_KEYSPACE,
+            "table_name": cls.ASTRA_TABLE_NAME
+        }
+    
+    @classmethod
     def validate_config(cls) -> bool:
         """Validate configuration settings"""
         errors = []
@@ -188,6 +210,15 @@ class Config:
         
         if cls.MIN_RECOMMENDATION_RATING < 0 or cls.MIN_RECOMMENDATION_RATING > 10:
             errors.append("MIN_RECOMMENDATION_RATING must be between 0 and 10")
+        
+        # Validate Astra configuration if using Astra
+        if cls.DATA_SOURCE.lower() == "astra":
+            if not cls.ASTRA_CLIENT_ID:
+                errors.append("ASTRA_CLIENT_ID is not set")
+            if not cls.ASTRA_CLIENT_SECRET:
+                errors.append("ASTRA_CLIENT_SECRET is not set")
+            if not os.path.exists(cls.ASTRA_SECURE_CONNECT_BUNDLE):
+                errors.append(f"ASTRA_SECURE_CONNECT_BUNDLE not found: {cls.ASTRA_SECURE_CONNECT_BUNDLE}")
         
         if errors:
             print("Configuration errors found:")
