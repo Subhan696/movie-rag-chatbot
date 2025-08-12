@@ -357,11 +357,18 @@ def extract_movie_document(details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def insert_if_new(collection, movie_doc: Dict[str, Any]) -> bool:
-    """Insert document if `_id` is not already present. Returns True if inserted."""
+    """Insert document if `_id` is not already present.
+
+    Returns True if inserted, False if skipped as duplicate. Logs action with title/year.
+    """
     existing = collection.find_one({"_id": movie_doc["_id"]})
+    title = movie_doc.get("title", "Unknown")
+    year = movie_doc.get("year", "?")
     if existing is not None:
+        logging.info(f"Skipped duplicate: {title} ({year})")
         return False
     collection.insert_one(movie_doc)
+    logging.info(f"Inserted: {title} ({year})")
     return True
 
 
