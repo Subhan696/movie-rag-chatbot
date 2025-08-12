@@ -4,27 +4,54 @@ import pandas as pd
 import google.generativeai as genai  # ✅ Gemini SDK
 from dotenv import load_dotenv
 import gradio as gr
+from typing import List, Dict, Any
 
-# 🔷 Load Gemini API key
+# Vector search client
+from astrapy import DataAPIClient
+
+# 🔷 Load env and Gemini
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 📁 Paths
-MOVIE_PATH = r"H:\\Subhan\\Hollywood_Top_Movies.xlsx"
 EXCEL_FILE = "user_info.xlsx"
 
-# 🔷 Load Movie Data
-df = pd.read_excel(MOVIE_PATH)
+# 🔷 AstraDB connection
+ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT", "")
+ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN", "")
+if not ASTRA_DB_API_ENDPOINT or not ASTRA_DB_APPLICATION_TOKEN:
+    raise RuntimeError("Missing ASTRA_DB_* env vars. Check .env")
 
-# Prepare the movie knowledge text
-movie_knowledge = ""
-for _, row in df.iterrows():
-    movie_knowledge += (
-        f"{row['Movie Name']} ({row['Year']}): {row['Description']}. "
-        f"Director: {row['Director']}. Cast: {row['Cast']}. Genre: {row['Genre']}. "
-        f"Box Office: {row['Box Office']}. IMDb: {row['IMDb Rating']}. "
-        f"Available on: {row['Streaming']}. Length: {row['Runtime (min)']} minutes.\n"
+client = DataAPIClient(ASTRA_DB_APPLICATION_TOKEN)
+database = client.get_database(ASTRA_DB_API_ENDPOINT)
+collection = database.get_collection("movies")
+
+# Embedding model info
+EMBEDDING_MODEL = "text-embedding-004"
+VECTOR_DIMENSION = 768
+
+def embed_text(text: str) -> List[float]:
+    """Get Gemini embedding vector for user query or document text."""
+    res = genai.embed_content(model=EMBEDDING_MODEL, content=(text or ""))
+    emb = res.get("embedding") if isinstance(res, dict) else getattr(res, "embedding", None)
+    if isinstance(emb, dict) and "values" in emb:
+        return emb["values"]
+    return emb
+
+def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Vector similarity search in AstraDB on `embedding` field."""
+    query_embedding = embed_text(user_query)
+    if not isinstance(query_embedding, list):
+        return []
+    # Vector sort uses the special $vector key
+    results = collection.find(
+        {},
+        sort={"$vector": query_embedding},
+        limit=top_k,
+        include_similarity=True,
     )
+    # astrapy returns a cursor-like iterable of dicts
+    return list(results)
 
 # 🔷 Session state
 def init_session():
@@ -59,7 +86,7 @@ def query_gpt(user_query, session):
         f"You are a friendly and helpful assistant answering questions about Hollywood movies. "
         f"The user you're helping is named {user_name} from {user_location}. "
         f"Make your responses conversational and, when natural, refer to them by name. "
-        f"Use only the movie dataset unless asked general knowledge. "
+        f"Use only the retrieved movie data unless asked general knowledge. "
         f"Refer to chat history to keep continuity in your responses."
     )
 
@@ -69,10 +96,23 @@ def query_gpt(user_query, session):
         role = turn["role"].capitalize()
         history_text += f"{role}: {turn['content']}\n"
 
+    # Retrieve relevant context via vector search
+    retrieved = retrieve_relevant_movies(user_query, top_k=5)
+    context_blocks = []
+    for m in retrieved:
+        context_blocks.append(
+            f"{m.get('title','N/A')} ({m.get('year','?')}): {m.get('description','')}. "
+            f"Director: {m.get('director','')}. Cast: {', '.join(m.get('cast', []) if isinstance(m.get('cast'), list) else [])}. "
+            f"Genre: {m.get('genre','')}. Box Office: {m.get('box_office','Unknown')}. "
+            f"IMDb: {m.get('imdb_rating',0)}. Available on: {m.get('streaming','Unknown')}. "
+            f"Length: {m.get('runtime_min',0)} minutes."
+        )
+    movie_context = "\n".join(context_blocks) if context_blocks else "(No relevant movies found in DB)"
+
     prompt = (
         f"{system_message}\n\n"
         f"### CHAT HISTORY:\n{history_text}\n"
-        f"### MOVIE DATA:\n{movie_knowledge}\n"
+        f"### RETRIEVED MOVIES:\n{movie_context}\n"
         f"### USER QUESTION:\n{user_query}"
     )
 
