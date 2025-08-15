@@ -7,6 +7,7 @@ import gradio as gr
 from typing import List, Dict, Any
 import requests  # For TMDB API
 import csv
+import re
 
 # Vector search client
 from astrapy import DataAPIClient
@@ -41,38 +42,97 @@ def embed_text(text: str) -> List[float]:
         return emb["values"]
     return emb
 
-def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Vector similarity search in AstraDB on `embedding` field."""
-    query_embedding = embed_text(user_query)
-    if not isinstance(query_embedding, list):
+def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> list:
+    """Vector similarity search in AstraDB on `embedding` field. Falls back to empty list on error."""
+    try:
+        query_embedding = embed_text(user_query)
+        if not isinstance(query_embedding, list):
+            return []
+        results = collection.find(
+            {},
+            sort={"$vector": query_embedding},
+            limit=top_k,
+            include_similarity=True,
+        )
+        return list(results)
+    except Exception:
         return []
-    # Vector sort uses the special $vector key
-    results = collection.find(
-        {},
-        sort={"$vector": query_embedding},
-        limit=top_k,
-        include_similarity=True,
-    )
-    # astrapy returns a cursor-like iterable of dicts
-    return list(results)
+
+def extract_movie_titles(text):
+    """Extract likely movie titles from user input using capitalization and known patterns."""
+    # Look for quoted titles
+    quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
+    titles = [q[0] or q[1] for q in quoted if q[0] or q[1]]
+    # Also look for capitalized phrases (simple heuristic)
+    cap_phrases = re.findall(r'([A-Z][a-zA-Z0-9: \'\-]+)', text)
+    for phrase in cap_phrases:
+        if len(phrase.split()) > 1 and phrase not in titles:
+            titles.append(phrase.strip())
+    # Remove duplicates, preserve order
+    seen = set()
+    result = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result
+
+def extract_year_and_platform(text):
+    """Extract year and streaming platform from user input."""
+    year = None
+    platform = None
+    # Look for a 4-digit year
+    m = re.search(r'(19|20)\d{2}', text)
+    if m:
+        year = m.group(0)
+    # Look for common streaming platforms
+    platforms = ['Netflix', 'Prime', 'Hulu', 'Disney', 'HBO', 'Apple TV', 'Peacock']
+    for p in platforms:
+        if p.lower() in text.lower():
+            platform = p
+            break
+    return year, platform
 
 # TMDB API setup
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_API_URL = "https://api.themoviedb.org/3"
 
-def fetch_movie_from_tmdb(query: str) -> dict:
-    """Fetch movie details from TMDB by search query."""
+def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) -> dict:
+    """Fetch movie details from TMDB by search query, with optional year and platform filtering."""
     if not TMDB_API_KEY:
         return {}
     search_url = f"{TMDB_API_URL}/search/movie"
     params = {"api_key": TMDB_API_KEY, "query": query}
+    if year:
+        params["year"] = year
     resp = requests.get(search_url, params=params)
     if resp.status_code != 200:
         return {}
     results = resp.json().get("results", [])
     if not results:
         return {}
-    movie = results[0]  # Take the top result
+    # If platform is specified, filter by streaming provider (using TMDB watch/providers API)
+    if platform:
+        for movie in results:
+            prov_url = f"{TMDB_API_URL}/movie/{movie['id']}/watch/providers"
+            prov_params = {"api_key": TMDB_API_KEY}
+            prov_resp = requests.get(prov_url, params=prov_params)
+            if prov_resp.status_code == 200:
+                prov_data = prov_resp.json().get("results", {})
+                # Check for US region (can be adjusted)
+                us = prov_data.get("US", {})
+                flatrate = us.get("flatrate", [])
+                if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
+                    # Add streaming info
+                    movie["streaming"] = platform
+                    break
+        else:
+            # No movie found on that platform
+            return {}
+        # Use the first matching movie
+        movie = movie
+    else:
+        movie = results[0]
     # Fetch more details
     details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
     details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
@@ -100,7 +160,7 @@ def fetch_movie_from_tmdb(query: str) -> dict:
         "box_office": details.get("revenue", "Unknown"),
         "imdb_rating": details.get("vote_average", 0),
         "runtime_min": details.get("runtime", 0),
-        "streaming": "Unknown"  # TMDB does not provide streaming info directly
+        "streaming": movie.get("streaming", "Unknown")
     }
 
 # 🔷 Session state
@@ -166,28 +226,56 @@ def query_gpt(user_query, session):
         history_text += f"{role}: {turn['content']}\n"
 
     # Retrieve relevant context via vector search
-    retrieved = retrieve_relevant_movies(user_query, top_k=5)
+    try:
+        retrieved = retrieve_relevant_movies(user_query, top_k=5)
+    except Exception:
+        retrieved = []
     context_blocks = []
-    for m in retrieved:
-        context_blocks.append(
-            f"{m.get('title','N/A')} ({m.get('year','?')}): {m.get('description','')}. "
-            f"Director: {m.get('director','')}. Cast: {', '.join(m.get('cast', []) if isinstance(m.get('cast'), list) else [])}. "
-            f"Genre: {m.get('genre','')}. Box Office: {m.get('box_office','Unknown')}. "
-            f"IMDb: {m.get('imdb_rating',0)}. Available on: {m.get('streaming','Unknown')}. "
-            f"Length: {m.get('runtime_min',0)} minutes."
-        )
-    # If no relevant movies found, try TMDB
-    if not context_blocks:
-        tmdb_movie = fetch_movie_from_tmdb(user_query)
-        if tmdb_movie:
+    used_titles = set()
+    # Extract explicit movie titles from user query
+    year, platform = extract_year_and_platform(user_query)
+    movie_titles = extract_movie_titles(user_query)
+    # Try to find exact matches in AstraDB results
+    for title in movie_titles:
+        found_in_db = None
+        for m in retrieved:
+            if title.lower() == str(m.get('title', '')).lower():
+                found_in_db = m
+                break
+        if found_in_db:
             context_blocks.append(
-                f"{tmdb_movie.get('title','N/A')} ({tmdb_movie.get('year','?')}): {tmdb_movie.get('description','')}. "
-                f"Director: {tmdb_movie.get('director','')}. Cast: {', '.join(tmdb_movie.get('cast', []))}. "
-                f"Genre: {tmdb_movie.get('genre','')}. Box Office: {tmdb_movie.get('box_office','Unknown')}. "
-                f"IMDb: {tmdb_movie.get('imdb_rating',0)}. Available on: {tmdb_movie.get('streaming','Unknown')}. "
-                f"Length: {tmdb_movie.get('runtime_min',0)} minutes."
+                f"{found_in_db.get('title','N/A')} ({found_in_db.get('year','?')}): {found_in_db.get('description','')}. "
+                f"Director: {found_in_db.get('director','')}. Cast: {', '.join(found_in_db.get('cast', []) if isinstance(found_in_db.get('cast'), list) else [])}. "
+                f"Genre: {found_in_db.get('genre','')}. Box Office: {found_in_db.get('box_office','Unknown')}. "
+                f"IMDb: {found_in_db.get('imdb_rating',0)}. Available on: {found_in_db.get('streaming','Unknown')}. "
+                f"Length: {found_in_db.get('runtime_min',0)} minutes."
             )
-    movie_context = "\n".join(context_blocks) if context_blocks else "(No relevant movies found in DB or TMDB)"
+            used_titles.add(title.lower())
+        else:
+            # Prefer TMDB if found
+            tmdb_movie = fetch_movie_from_tmdb(title, year=year, platform=platform)
+            if tmdb_movie:
+                context_blocks.append(
+                    f"{tmdb_movie.get('title','N/A')} ({tmdb_movie.get('year','?')}): {tmdb_movie.get('description','')}. "
+                    f"Director: {tmdb_movie.get('director','')}. Cast: {', '.join(tmdb_movie.get('cast', []))}. "
+                    f"Genre: {tmdb_movie.get('genre','')}. Box Office: {tmdb_movie.get('box_office','Unknown')}. "
+                    f"IMDb: {tmdb_movie.get('imdb_rating',0)}. Available on: {tmdb_movie.get('streaming','Unknown')}. "
+                    f"Length: {tmdb_movie.get('runtime_min',0)} minutes."
+                )
+                used_titles.add(title.lower())
+    # If no explicit titles or nothing found, fall back to AstraDB results
+    if not context_blocks:
+        for m in retrieved:
+            context_blocks.append(
+                f"{m.get('title','N/A')} ({m.get('year','?')}): {m.get('description','')}. "
+                f"Director: {m.get('director','')}. Cast: {', '.join(m.get('cast', []) if isinstance(m.get('cast'), list) else [])}. "
+                f"Genre: {m.get('genre','')}. Box Office: {m.get('box_office','Unknown')}. "
+                f"IMDb: {m.get('imdb_rating',0)}. Available on: {m.get('streaming','Unknown')}. "
+                f"Length: {m.get('runtime_min',0)} minutes."
+            )
+    if not context_blocks:
+        context_blocks.append("(No relevant movies found in DB or TMDB for the titles mentioned.)")
+    movie_context = "\n".join(context_blocks)
 
     prompt = (
         f"{system_message}\n\n"
@@ -233,16 +321,16 @@ def recommend_movies(session, top_k=3):
     if prefs.get("directors"):
         query_parts.append(f"director: {', '.join(list(prefs['directors']))}")
     query = ", ".join(query_parts) if query_parts else "popular movies"
-    results = retrieve_relevant_movies(query, top_k=top_k)
+    try:
+        results = retrieve_relevant_movies(query, top_k=top_k)
+    except Exception:
+        results = []
     if not results:
         # Fallback: TMDB discover API
         if not TMDB_API_KEY:
             return []
         discover_url = f"{TMDB_API_URL}/discover/movie"
         params = {"api_key": TMDB_API_KEY, "sort_by": "popularity.desc", "page": 1}
-        if prefs.get("genres"):
-            # TMDB genre IDs would be needed for more accuracy
-            pass
         resp = requests.get(discover_url, params=params)
         if resp.status_code != 200:
             return []
@@ -290,7 +378,6 @@ def handle_input(user_input, session):
     session["chat_history"].append({"role": "user", "content": user_input})
 
     # Try to resolve follow-up/ambiguous queries
-    import re
     followup_patterns = [
         r"who (directed|is the director)",
         r"who (starred|acted|is in it)",
@@ -307,7 +394,6 @@ def handle_input(user_input, session):
         # Normal flow: get response and update last_movie if possible
         movie_response = query_gpt(user_input, session)
         # Try to extract the main movie discussed from the response (simple heuristic)
-        import re
         m = re.search(r"([A-Za-z0-9: '\-]+) \([0-9]{4}\)", movie_response)
         if m:
             session["last_movie"] = m.group(1).strip()
@@ -317,7 +403,6 @@ def handle_input(user_input, session):
     # (insert after updating last_movie and last_movie_context)
     if session.get("last_movie_context"):
         # Try to extract movie info from last_movie_context (simple heuristic)
-        import re
         info = {}
         ctx = session["last_movie_context"]
         m = re.search(r"(?P<title>[A-Za-z0-9: '\-]+) \((?P<year>[0-9]{4})\): (?P<desc>.*?)\. Director: (?P<director>[^.]*). Cast: (?P<cast>[^.]*). Genre: (?P<genre>[^.]*).", ctx)
