@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import gradio as gr
 from typing import List, Dict, Any
 import requests  # For TMDB API
+import csv
 
 # Vector search client
 from astrapy import DataAPIClient
@@ -16,6 +17,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 📁 Paths
 EXCEL_FILE = "user_info.xlsx"
+FEEDBACK_FILE = "chatbot_feedback.csv"
 
 # 🔷 AstraDB connection
 ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT", "")
@@ -127,6 +129,22 @@ def save_user_info(session):
     else:
         df = pd.DataFrame([user_info])
     df.to_excel(EXCEL_FILE, index=False)
+
+# 🔷 Save feedback
+def save_feedback(user, message, response, rating):
+    """Save feedback to a CSV file."""
+    row = {
+        "User": user,
+        "Message": message,
+        "Response": response,
+        "Rating": rating
+    }
+    file_exists = os.path.exists(FEEDBACK_FILE)
+    with open(FEEDBACK_FILE, mode="a", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 # 🔷 Gemini query using full chat history + personalization
 def query_gpt(user_query, session):
@@ -320,6 +338,14 @@ def on_submit(user_message, chat_history, state):
 def on_clear():
     return [], "", init_session()
 
+def on_feedback(rating, chat_history, state):
+    # Save feedback for the last exchange
+    if chat_history and len(chat_history) > 0:
+        last_user, last_response = chat_history[-1]
+        user = state.get("name", "User")
+        save_feedback(user, last_user, last_response, rating)
+    return chat_history, state
+
 # 🔷 Gradio app
 with gr.Blocks() as demo:
     gr.Markdown("## \U0001F3AC Hollywood Movie Chatbot + User Info")
@@ -327,8 +353,10 @@ with gr.Blocks() as demo:
     msg = gr.Textbox(label="Your Message", placeholder="Hi!")
     clear = gr.Button("Clear Chat")
     state = gr.State(init_session())
+    feedback = gr.Radio(["👍", "👎"], label="Rate the last answer", visible=True)
 
     msg.submit(on_submit, [msg, chatbot, state], [msg, chatbot, state])
     clear.click(on_clear, [], [chatbot, msg, state])
+    feedback.change(on_feedback, [feedback, chatbot, state], [chatbot, state])
 
 demo.launch()
