@@ -5,6 +5,7 @@ import google.generativeai as genai  # ✅ Gemini SDK
 from dotenv import load_dotenv
 import gradio as gr
 from typing import List, Dict, Any
+import requests  # For TMDB API
 
 # Vector search client
 from astrapy import DataAPIClient
@@ -52,6 +53,53 @@ def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> List[Dict[str, 
     )
     # astrapy returns a cursor-like iterable of dicts
     return list(results)
+
+# TMDB API setup
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+TMDB_API_URL = "https://api.themoviedb.org/3"
+
+def fetch_movie_from_tmdb(query: str) -> dict:
+    """Fetch movie details from TMDB by search query."""
+    if not TMDB_API_KEY:
+        return {}
+    search_url = f"{TMDB_API_URL}/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": query}
+    resp = requests.get(search_url, params=params)
+    if resp.status_code != 200:
+        return {}
+    results = resp.json().get("results", [])
+    if not results:
+        return {}
+    movie = results[0]  # Take the top result
+    # Fetch more details
+    details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
+    details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
+    details_resp = requests.get(details_url, params=details_params)
+    if details_resp.status_code != 200:
+        return movie
+    details = details_resp.json()
+    # Extract director and cast
+    director = ""
+    cast = []
+    for member in details.get("credits", {}).get("crew", []):
+        if member.get("job") == "Director":
+            director = member.get("name")
+            break
+    for actor in details.get("credits", {}).get("cast", [])[:5]:
+        cast.append(actor.get("name"))
+    # Compose movie info
+    return {
+        "title": details.get("title", movie.get("title")),
+        "year": details.get("release_date", "?")[:4],
+        "description": details.get("overview", movie.get("overview", "")),
+        "director": director,
+        "cast": cast,
+        "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
+        "box_office": details.get("revenue", "Unknown"),
+        "imdb_rating": details.get("vote_average", 0),
+        "runtime_min": details.get("runtime", 0),
+        "streaming": "Unknown"  # TMDB does not provide streaming info directly
+    }
 
 # 🔷 Session state
 def init_session():
@@ -107,7 +155,18 @@ def query_gpt(user_query, session):
             f"IMDb: {m.get('imdb_rating',0)}. Available on: {m.get('streaming','Unknown')}. "
             f"Length: {m.get('runtime_min',0)} minutes."
         )
-    movie_context = "\n".join(context_blocks) if context_blocks else "(No relevant movies found in DB)"
+    # If no relevant movies found, try TMDB
+    if not context_blocks:
+        tmdb_movie = fetch_movie_from_tmdb(user_query)
+        if tmdb_movie:
+            context_blocks.append(
+                f"{tmdb_movie.get('title','N/A')} ({tmdb_movie.get('year','?')}): {tmdb_movie.get('description','')}. "
+                f"Director: {tmdb_movie.get('director','')}. Cast: {', '.join(tmdb_movie.get('cast', []))}. "
+                f"Genre: {tmdb_movie.get('genre','')}. Box Office: {tmdb_movie.get('box_office','Unknown')}. "
+                f"IMDb: {tmdb_movie.get('imdb_rating',0)}. Available on: {tmdb_movie.get('streaming','Unknown')}. "
+                f"Length: {tmdb_movie.get('runtime_min',0)} minutes."
+            )
+    movie_context = "\n".join(context_blocks) if context_blocks else "(No relevant movies found in DB or TMDB)"
 
     prompt = (
         f"{system_message}\n\n"
