@@ -107,7 +107,10 @@ def init_session():
         "name": None, "phone": None, "email": None, "location": None,
         "collected": False,
         "chat_history": [],
-        "first_prompt": True
+        "first_prompt": True,
+        "last_movie": None,
+        "last_movie_context": None,
+        "preferences": {"genres": set(), "actors": set(), "directors": set()}
     }
 
 # 🔷 Save user info
@@ -182,6 +185,59 @@ def query_gpt(user_query, session):
     except Exception as e:
         return f"Sorry {user_name}, I encountered an error while fetching the response. Please try again later."
 
+def update_preferences(session, movie_info):
+    """Update user preferences in session based on movie info."""
+    if not movie_info:
+        return
+    prefs = session.setdefault("preferences", {"genres": set(), "actors": set(), "directors": set()})
+    # Add genres
+    genres = movie_info.get("genre", "")
+    if genres:
+        for g in genres.split(","):
+            prefs["genres"].add(g.strip())
+    # Add actors
+    for actor in movie_info.get("cast", []):
+        prefs["actors"].add(actor)
+    # Add director
+    director = movie_info.get("director", "")
+    if director:
+        prefs["directors"].add(director)
+
+def recommend_movies(session, top_k=3):
+    """Recommend movies based on user preferences using AstraDB or TMDB."""
+    prefs = session.get("preferences", {})
+    # Try AstraDB vector search first
+    query_parts = []
+    if prefs.get("genres"):
+        query_parts.append(f"genre: {', '.join(list(prefs['genres']))}")
+    if prefs.get("actors"):
+        query_parts.append(f"cast: {', '.join(list(prefs['actors']))}")
+    if prefs.get("directors"):
+        query_parts.append(f"director: {', '.join(list(prefs['directors']))}")
+    query = ", ".join(query_parts) if query_parts else "popular movies"
+    results = retrieve_relevant_movies(query, top_k=top_k)
+    if not results:
+        # Fallback: TMDB discover API
+        if not TMDB_API_KEY:
+            return []
+        discover_url = f"{TMDB_API_URL}/discover/movie"
+        params = {"api_key": TMDB_API_KEY, "sort_by": "popularity.desc", "page": 1}
+        if prefs.get("genres"):
+            # TMDB genre IDs would be needed for more accuracy
+            pass
+        resp = requests.get(discover_url, params=params)
+        if resp.status_code != 200:
+            return []
+        movies = resp.json().get("results", [])[:top_k]
+        return [
+            {
+                "title": m.get("title"),
+                "year": m.get("release_date", "?")[:4],
+                "description": m.get("overview", "")
+            } for m in movies
+        ]
+    return results
+
 # 🔷 Handle input from user
 def handle_input(user_input, session):
     if session["first_prompt"]:
@@ -238,6 +294,19 @@ def handle_input(user_input, session):
         if m:
             session["last_movie"] = m.group(1).strip()
             session["last_movie_context"] = movie_response
+
+    # After getting movie_response, update preferences if a movie was discussed
+    # (insert after updating last_movie and last_movie_context)
+    if session.get("last_movie_context"):
+        # Try to extract movie info from last_movie_context (simple heuristic)
+        import re
+        info = {}
+        ctx = session["last_movie_context"]
+        m = re.search(r"(?P<title>[A-Za-z0-9: '\-]+) \((?P<year>[0-9]{4})\): (?P<desc>.*?)\. Director: (?P<director>[^.]*). Cast: (?P<cast>[^.]*). Genre: (?P<genre>[^.]*).", ctx)
+        if m:
+            info = m.groupdict()
+            info["cast"] = [a.strip() for a in info.get("cast", "").split(",") if a.strip()]
+        update_preferences(session, info)
 
     session["chat_history"].append({"role": "assistant", "content": movie_response})
     return movie_response, session
