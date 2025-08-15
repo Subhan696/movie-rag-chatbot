@@ -208,10 +208,38 @@ def handle_input(user_input, session):
                 f"Let's get started! \U0001F37F"
             ), session
 
-    session["chat_history"].append({"role": "user", "content": user_input})
-    movie_response = query_gpt(user_input, session)
-    session["chat_history"].append({"role": "assistant", "content": movie_response})
+    # --- Context Awareness: Track last discussed movie ---
+    session.setdefault("last_movie", None)
+    session.setdefault("last_movie_context", None)
 
+    # Add user input to chat history
+    session["chat_history"].append({"role": "user", "content": user_input})
+
+    # Try to resolve follow-up/ambiguous queries
+    import re
+    followup_patterns = [
+        r"who (directed|is the director)",
+        r"who (starred|acted|is in it)",
+        r"what (is|was) the box office",
+        r"what (is|was) the genre",
+        r"how long (is|was) it",
+        r"where can i watch|stream (it|this|that)"
+    ]
+    is_followup = any(re.search(pat, user_input, re.I) for pat in followup_patterns)
+    if is_followup and session["last_movie_context"]:
+        # Use last movie context for the answer
+        movie_response = session["last_movie_context"]
+    else:
+        # Normal flow: get response and update last_movie if possible
+        movie_response = query_gpt(user_input, session)
+        # Try to extract the main movie discussed from the response (simple heuristic)
+        import re
+        m = re.search(r"([A-Za-z0-9: '\-]+) \([0-9]{4}\)", movie_response)
+        if m:
+            session["last_movie"] = m.group(1).strip()
+            session["last_movie_context"] = movie_response
+
+    session["chat_history"].append({"role": "assistant", "content": movie_response})
     return movie_response, session
 
 # 🔷 Gradio callbacks
