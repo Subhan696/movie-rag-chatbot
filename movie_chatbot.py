@@ -380,31 +380,68 @@ def recommend_movies(session, top_k=3):
         return tmdb_discover_movies(top_k=top_k)
     return results
 
+def is_valid_email(email):
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email)
+
+def is_valid_phone(phone):
+    return re.match(r"^\+?\d{7,15}$", phone)
+
 # 🔷 Handle input from user
 def handle_input(user_input, session):
+    user_input_lower = user_input.strip().lower()
+    # Allow user to update info at any time
+    if user_input_lower in ["update my info", "change my info", "edit my info"]:
+        session["collected"] = False
+        session["name"] = None
+        session["phone"] = None
+        session["email"] = None
+        session["location"] = None
+        return "Let's update your information. May I have your name, please?", session
+
     if session["first_prompt"]:
         session["first_prompt"] = False
-        return "Hello! \U0001F44B\nMay I have your name, please?\n", session
+        return (
+            "Hello! \U0001F44B\nMay I have your name, please?\n\n"
+            "*Privacy Notice: Your name, phone, email, and location are stored in a local file for personalization. "
+            "You may skip phone/email/location by typing 'skip'.*\n",
+            session
+        )
 
     if not session["collected"]:
         if not session["name"]:
+            if user_input_lower == "skip" or not user_input.strip():
+                return "Name is required. Please enter your name:", session
             session["name"] = user_input.strip()
-            return "Thank you, may I have your phone number?", session
+            return "Thank you, may I have your phone number? (or type 'skip')", session
         elif not session["phone"]:
+            if user_input_lower == "skip":
+                session["phone"] = "(skipped)"
+                return "Great. May I have your email address? (or type 'skip')", session
+            elif not is_valid_phone(user_input.strip()):
+                return "That doesn't look like a valid phone number. Please enter a valid phone or type 'skip':", session
             session["phone"] = user_input.strip()
-            return "Great. May I have your email address?", session
+            return "Great. May I have your email address? (or type 'skip')", session
         elif not session["email"]:
+            if user_input_lower == "skip":
+                session["email"] = "(skipped)"
+                return "Thank you. Lastly, may I know your location? (or type 'skip')", session
+            elif not is_valid_email(user_input.strip()):
+                return "That doesn't look like a valid email address. Please enter a valid email or type 'skip':", session
             session["email"] = user_input.strip()
-            return "Thank you. Lastly, may I know your location?", session
+            return "Thank you. Lastly, may I know your location? (or type 'skip')", session
         elif not session["location"]:
-            session["location"] = user_input.strip()
+            if user_input_lower == "skip":
+                session["location"] = "(skipped)"
+            else:
+                session["location"] = user_input.strip()
             session["collected"] = True
             save_user_info(session)
             return (
                 f"Awesome, {session['name']} from {session['location']}! \U0001F389\n"
                 f"You can now ask me anything about Hollywood movies — cast, director, box office, or where to stream them. "
-                f"Let's get started! \U0001F37F"
-            ), session
+                f"Let's get started! \U0001F37F\n\n*You can update your info anytime by typing 'update my info'.*",
+                session
+            )
 
     # --- Context Awareness: Track last discussed movie ---
     session.setdefault("last_movie", None)
