@@ -44,6 +44,9 @@ def embed_text(text: str) -> List[float]:
 
 def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> list:
     # Restore AstraDB logic for hybrid approach
+    ok, err = check_astradb_config()
+    if not ok:
+        return [{"error": err}]
     try:
         query_embedding = embed_text(user_query)
         if not isinstance(query_embedding, list):
@@ -55,8 +58,24 @@ def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> list:
             include_similarity=True,
         )
         return list(results)
-    except Exception:
-        return []
+    except Exception as e:
+        return [{"error": f"AstraDB error: {str(e)}"}]
+
+# --- API Config Checks ---
+def check_astradb_config():
+    if not ASTRA_DB_API_ENDPOINT or not ASTRA_DB_APPLICATION_TOKEN:
+        return False, "AstraDB configuration is missing. Please set ASTRA_DB_API_ENDPOINT and ASTRA_DB_APPLICATION_TOKEN in your .env file."
+    return True, None
+
+def check_tmdb_config():
+    if not TMDB_API_KEY:
+        return False, "TMDB API key is missing. Please set TMDB_API_KEY in your .env file."
+    return True, None
+
+def check_gemini_config():
+    if not os.getenv("GEMINI_API_KEY"):
+        return False, "Gemini API key is missing. Please set GEMINI_API_KEY in your .env file."
+    return True, None
 
 def extract_movie_titles(text):
     """Extract likely movie titles from user input using capitalization, known patterns, and TMDB fuzzy search as fallback."""
@@ -127,69 +146,67 @@ TMDB_API_URL = "https://api.themoviedb.org/3"
 
 def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) -> dict:
     """Fetch movie details from TMDB by search query, with optional year and platform filtering."""
-    if not TMDB_API_KEY:
-        return {}
-    search_url = f"{TMDB_API_URL}/search/movie"
-    params = {"api_key": TMDB_API_KEY, "query": query}
-    if year:
-        params["year"] = year
-    resp = requests.get(search_url, params=params)
-    if resp.status_code != 200:
-        return {}
-    results = resp.json().get("results", [])
-    if not results:
-        return {}
-    # If platform is specified, filter by streaming provider (using TMDB watch/providers API)
-    if platform:
-        for movie in results:
-            prov_url = f"{TMDB_API_URL}/movie/{movie['id']}/watch/providers"
-            prov_params = {"api_key": TMDB_API_KEY}
-            prov_resp = requests.get(prov_url, params=prov_params)
-            if prov_resp.status_code == 200:
-                prov_data = prov_resp.json().get("results", {})
-                # Check for US region (can be adjusted)
-                us = prov_data.get("US", {})
-                flatrate = us.get("flatrate", [])
-                if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
-                    # Add streaming info
-                    movie["streaming"] = platform
-                    break
+    ok, err = check_tmdb_config()
+    if not ok:
+        return {"error": err}
+    try:
+        search_url = f"{TMDB_API_URL}/search/movie"
+        params = {"api_key": TMDB_API_KEY, "query": query}
+        if year:
+            params["year"] = year
+        resp = requests.get(search_url, params=params)
+        if resp.status_code != 200:
+            return {"error": f"TMDB search error: {resp.status_code}"}
+        results = resp.json().get("results", [])
+        if not results:
+            return {"error": "No results found in TMDB."}
+        # If platform is specified, filter by streaming provider (using TMDB watch/providers API)
+        if platform:
+            for movie in results:
+                prov_url = f"{TMDB_API_URL}/movie/{movie['id']}/watch/providers"
+                prov_params = {"api_key": TMDB_API_KEY}
+                prov_resp = requests.get(prov_url, params=prov_params)
+                if prov_resp.status_code == 200:
+                    prov_data = prov_resp.json().get("results", {})
+                    us = prov_data.get("US", {})
+                    flatrate = us.get("flatrate", [])
+                    if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
+                        movie["streaming"] = platform
+                        break
+            else:
+                return {"error": f"No movie found on {platform}."}
+            movie = movie
         else:
-            # No movie found on that platform
-            return {}
-        # Use the first matching movie
-        movie = movie
-    else:
-        movie = results[0]
-    # Fetch more details
-    details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
-    details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
-    details_resp = requests.get(details_url, params=details_params)
-    if details_resp.status_code != 200:
-        return movie
-    details = details_resp.json()
-    # Extract director and cast
-    director = ""
-    cast = []
-    for member in details.get("credits", {}).get("crew", []):
-        if member.get("job") == "Director":
-            director = member.get("name")
-            break
-    for actor in details.get("credits", {}).get("cast", [])[:5]:
-        cast.append(actor.get("name"))
-    # Compose movie info
-    return {
-        "title": details.get("title", movie.get("title")),
-        "year": details.get("release_date", "?")[:4],
-        "description": details.get("overview", movie.get("overview", "")),
-        "director": director,
-        "cast": cast,
-        "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
-        "box_office": details.get("revenue", "Unknown"),
-        "imdb_rating": details.get("vote_average", 0),
-        "runtime_min": details.get("runtime", 0),
-        "streaming": movie.get("streaming", "Unknown")
-    }
+            movie = results[0]
+        # Fetch more details
+        details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
+        details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
+        details_resp = requests.get(details_url, params=details_params)
+        if details_resp.status_code != 200:
+            return {"error": f"TMDB details error: {details_resp.status_code}"}
+        details = details_resp.json()
+        director = ""
+        cast = []
+        for member in details.get("credits", {}).get("crew", []):
+            if member.get("job") == "Director":
+                director = member.get("name")
+                break
+        for actor in details.get("credits", {}).get("cast", [])[:5]:
+            cast.append(actor.get("name"))
+        return {
+            "title": details.get("title", movie.get("title")),
+            "year": details.get("release_date", "?")[:4],
+            "description": details.get("overview", movie.get("overview", "")),
+            "director": director,
+            "cast": cast,
+            "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
+            "box_office": details.get("revenue", "Unknown"),
+            "imdb_rating": details.get("vote_average", 0),
+            "runtime_min": details.get("runtime", 0),
+            "streaming": movie.get("streaming", "Unknown")
+        }
+    except Exception as e:
+        return {"error": f"TMDB error: {str(e)}"}
 
 def tmdb_discover_movies(year=None, genre=None, platform=None, top_k=5):
     """Fetch movies from TMDB discover endpoint with optional year, genre, and platform filters."""
@@ -267,6 +284,9 @@ def save_feedback(user, message, response, rating):
 
 # 🔷 Gemini query using full chat history + personalization
 def query_gpt(user_query, session):
+    ok, err = check_gemini_config()
+    if not ok:
+        return err
     user_name = session.get("name", "User")
     user_location = session.get("location", "their location")
 
