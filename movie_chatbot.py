@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 import requests  # For TMDB API
 import csv
 import re
+import concurrent.futures  # For parallel TMDB API calls
 
 # Vector search client
 from astrapy import DataAPIClient
@@ -144,8 +145,43 @@ def extract_genre(text):
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_API_URL = "https://api.themoviedb.org/3"
 
+def fetch_movie_details_parallel(movie_ids):
+    """Fetch movie details in parallel for a list of TMDB movie IDs."""
+    def fetch_details(mid):
+        details_url = f"{TMDB_API_URL}/movie/{mid}"
+        details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
+        try:
+            resp = requests.get(details_url, params=details_params)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(fetch_details, movie_ids))
+    return results
+
+def fetch_streaming_providers_parallel(movie_ids, platform):
+    """Fetch streaming provider info in parallel for a list of TMDB movie IDs."""
+    def fetch_provider(mid):
+        prov_url = f"{TMDB_API_URL}/movie/{mid}/watch/providers"
+        prov_params = {"api_key": TMDB_API_KEY}
+        try:
+            resp = requests.get(prov_url, params=prov_params)
+            if resp.status_code == 200:
+                prov_data = resp.json().get("results", {})
+                us = prov_data.get("US", {})
+                flatrate = us.get("flatrate", [])
+                if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
+                    return True
+        except Exception:
+            pass
+        return False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(fetch_provider, movie_ids))
+    return results
+
 def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) -> dict:
-    """Fetch movie details from TMDB by search query, with optional year and platform filtering."""
     ok, err = check_tmdb_config()
     if not ok:
         return {"error": err}
@@ -160,25 +196,20 @@ def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) ->
         results = resp.json().get("results", [])
         if not results:
             return {"error": "No results found in TMDB."}
-        # If platform is specified, filter by streaming provider (using TMDB watch/providers API)
+        # If platform is specified, filter by streaming provider (using TMDB watch/providers API) in parallel
         if platform:
-            for movie in results:
-                prov_url = f"{TMDB_API_URL}/movie/{movie['id']}/watch/providers"
-                prov_params = {"api_key": TMDB_API_KEY}
-                prov_resp = requests.get(prov_url, params=prov_params)
-                if prov_resp.status_code == 200:
-                    prov_data = prov_resp.json().get("results", {})
-                    us = prov_data.get("US", {})
-                    flatrate = us.get("flatrate", [])
-                    if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
-                        movie["streaming"] = platform
-                        break
+            movie_ids = [movie['id'] for movie in results]
+            provider_matches = fetch_streaming_providers_parallel(movie_ids, platform)
+            for idx, match in enumerate(provider_matches):
+                if match:
+                    results[idx]["streaming"] = platform
+                    movie = results[idx]
+                    break
             else:
                 return {"error": f"No movie found on {platform}."}
-            movie = movie
         else:
             movie = results[0]
-        # Fetch more details
+        # Fetch details for the selected movie
         details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
         details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
         details_resp = requests.get(details_url, params=details_params)
@@ -209,15 +240,14 @@ def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) ->
         return {"error": f"TMDB error: {str(e)}"}
 
 def tmdb_discover_movies(year=None, genre=None, platform=None, top_k=5):
-    """Fetch movies from TMDB discover endpoint with optional year, genre, and platform filters."""
-    if not TMDB_API_KEY:
-        return []
+    ok, err = check_tmdb_config()
+    if not ok:
+        return [{"error": err}]
     discover_url = f"{TMDB_API_URL}/discover/movie"
     params = {"api_key": TMDB_API_KEY, "sort_by": "popularity.desc", "page": 1}
     if year:
         params["year"] = year
     if genre:
-        # Map genre name to TMDB genre ID
         genre_map = {
             'Action': 28, 'Adventure': 12, 'Animation': 16, 'Comedy': 35, 'Crime': 80, 'Documentary': 99,
             'Drama': 18, 'Family': 10751, 'Fantasy': 14, 'History': 36, 'Horror': 27, 'Music': 10402,
@@ -229,15 +259,36 @@ def tmdb_discover_movies(year=None, genre=None, platform=None, top_k=5):
             params["with_genres"] = genre_id
     resp = requests.get(discover_url, params=params)
     if resp.status_code != 200:
-        return []
+        return [{"error": f"TMDB discover error: {resp.status_code}"}]
     movies = resp.json().get("results", [])[:top_k]
-    return [
-        {
-            "title": m.get("title"),
-            "year": m.get("release_date", "?")[:4],
-            "description": m.get("overview", "")
-        } for m in movies
-    ]
+    # Fetch details in parallel for all movies
+    movie_ids = [m['id'] for m in movies]
+    details_list = fetch_movie_details_parallel(movie_ids)
+    results = []
+    for m, details in zip(movies, details_list):
+        if not details:
+            continue
+        director = ""
+        cast = []
+        for member in details.get("credits", {}).get("crew", []):
+            if member.get("job") == "Director":
+                director = member.get("name")
+                break
+        for actor in details.get("credits", {}).get("cast", [])[:5]:
+            cast.append(actor.get("name"))
+        results.append({
+            "title": details.get("title", m.get("title")),
+            "year": details.get("release_date", "?")[:4],
+            "description": details.get("overview", m.get("overview", "")),
+            "director": director,
+            "cast": cast,
+            "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
+            "box_office": details.get("revenue", "Unknown"),
+            "imdb_rating": details.get("vote_average", 0),
+            "runtime_min": details.get("runtime", 0),
+            "streaming": m.get("streaming", "Unknown")
+        })
+    return results
 
 # 🔷 Session state
 def init_session():
