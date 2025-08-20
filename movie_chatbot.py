@@ -267,13 +267,14 @@ def save_user_info(session):
     df.to_excel(EXCEL_FILE, index=False)
 
 # 🔷 Save feedback
-def save_feedback(user, message, response, rating):
+def save_feedback(user, message, response, rating, comment=None):
     """Save feedback to a CSV file."""
     row = {
         "User": user,
         "Message": message,
         "Response": response,
-        "Rating": rating
+        "Rating": rating,
+        "Comment": comment or ""
     }
     file_exists = os.path.exists(FEEDBACK_FILE)
     with open(FEEDBACK_FILE, mode="a", newline='', encoding="utf-8") as f:
@@ -562,12 +563,12 @@ def on_submit(user_message, chat_history, state):
 def on_clear():
     return [], "", init_session()
 
-def on_feedback(rating, chat_history, state):
+def on_feedback(rating, comment, chat_history, state):
     # Save feedback for the last exchange
     if chat_history and len(chat_history) > 0:
         last_user, last_response = chat_history[-1]
         user = state.get("name", "User")
-        save_feedback(user, last_user, last_response, rating)
+        save_feedback(user, last_user, last_response, rating, comment)
     return chat_history, state
 
 # 🔷 Gradio app
@@ -578,9 +579,11 @@ with gr.Blocks() as demo:
     clear = gr.Button("Clear Chat")
     state = gr.State(init_session())
     feedback = gr.Radio(["👍", "👎"], label="Rate the last answer", visible=True)
+    feedback_comment = gr.Textbox(label="Feedback Comment (optional)", placeholder="Tell us more about your experience...", lines=2)
 
     msg.submit(on_submit, [msg, chatbot, state], [msg, chatbot, state])
     clear.click(on_clear, [], [chatbot, msg, state])
-    feedback.change(on_feedback, [feedback, chatbot, state], [chatbot, state])
+    feedback.change(on_feedback, [feedback, feedback_comment, chatbot, state], [chatbot, state])
+    feedback_comment.submit(on_feedback, [feedback, feedback_comment, chatbot, state], [chatbot, state])
 
 demo.launch()
