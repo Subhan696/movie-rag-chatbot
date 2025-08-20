@@ -59,7 +59,7 @@ def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> list:
         return []
 
 def extract_movie_titles(text):
-    """Extract likely movie titles from user input using capitalization and known patterns."""
+    """Extract likely movie titles from user input using capitalization, known patterns, and TMDB fuzzy search as fallback."""
     # Look for quoted titles
     quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
     titles = [q[0] or q[1] for q in quoted if q[0] or q[1]]
@@ -75,6 +75,22 @@ def extract_movie_titles(text):
         if t not in seen:
             seen.add(t)
             result.append(t)
+    # Fallback: If nothing found, try TMDB search for fuzzy match
+    if not result and TMDB_API_KEY:
+        search_url = f"{TMDB_API_URL}/search/movie"
+        params = {"api_key": TMDB_API_KEY, "query": text}
+        try:
+            resp = requests.get(search_url, params=params)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results:
+                    # Return top 1-2 matches
+                    for m in results[:2]:
+                        title = m.get("title")
+                        if title and title not in result:
+                            result.append(title)
+        except Exception:
+            pass
     return result
 
 def extract_year_and_platform(text):
@@ -386,6 +402,31 @@ def is_valid_email(email):
 def is_valid_phone(phone):
     return re.match(r"^\+?\d{7,15}$", phone)
 
+def is_followup_intent(user_input, session):
+    """Use Gemini to classify if the user input is a follow-up/ambiguous query."""
+    try:
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
+        prompt = (
+            "You are an intent classifier for a movie chatbot. "
+            "Given the user's message and recent chat history, answer only 'yes' if the message is a follow-up (e.g., refers to 'it', 'that', 'this', or asks about director, cast, box office, genre, runtime, or streaming info of a previously discussed movie), otherwise answer 'no'.\n"
+            f"User message: {user_input}\n"
+            f"Recent chat history: {session['chat_history'][-3:] if session.get('chat_history') else ''}"
+        )
+        response = model.generate_content(prompt)
+        return response.text.strip().lower().startswith('yes')
+    except Exception:
+        # Fallback to regex if Gemini fails
+        followup_patterns = [
+            r"who (directed|is the director)",
+            r"who (starred|acted|is in it)",
+            r"what (is|was) the box office",
+            r"what (is|was) the genre",
+            r"how long (is|was) it",
+            r"where can i watch|stream (it|this|that)",
+            r"(it|this|that)"
+        ]
+        return any(re.search(pat, user_input, re.I) for pat in followup_patterns)
+
 # 🔷 Handle input from user
 def handle_input(user_input, session):
     user_input_lower = user_input.strip().lower()
@@ -450,16 +491,8 @@ def handle_input(user_input, session):
     # Add user input to chat history
     session["chat_history"].append({"role": "user", "content": user_input})
 
-    # Try to resolve follow-up/ambiguous queries
-    followup_patterns = [
-        r"who (directed|is the director)",
-        r"who (starred|acted|is in it)",
-        r"what (is|was) the box office",
-        r"what (is|was) the genre",
-        r"how long (is|was) it",
-        r"where can i watch|stream (it|this|that)"
-    ]
-    is_followup = any(re.search(pat, user_input, re.I) for pat in followup_patterns)
+    # Improved follow-up detection
+    is_followup = is_followup_intent(user_input, session)
     if is_followup and session["last_movie_context"]:
         # Use last movie context for the answer
         movie_response = session["last_movie_context"]
@@ -473,7 +506,6 @@ def handle_input(user_input, session):
             session["last_movie_context"] = movie_response
 
     # After getting movie_response, update preferences if a movie was discussed
-    # (insert after updating last_movie and last_movie_context)
     if session.get("last_movie_context"):
         # Try to extract movie info from last_movie_context (simple heuristic)
         info = {}
