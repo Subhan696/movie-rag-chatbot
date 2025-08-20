@@ -306,34 +306,16 @@ def query_gpt(user_query, session):
             if missing_info:
                 tmdb_movie = fetch_movie_from_tmdb(title, year=year, platform=platform)
                 if tmdb_movie:
-                    context_blocks.append(
-                        f"{tmdb_movie.get('title','N/A')} ({tmdb_movie.get('year','?')}): {tmdb_movie.get('description','')}. "
-                        f"Director: {tmdb_movie.get('director','')}. Cast: {', '.join(tmdb_movie.get('cast', []))}. "
-                        f"Genre: {tmdb_movie.get('genre','')}. Box Office: {tmdb_movie.get('box_office','Unknown')}. "
-                        f"IMDb: {tmdb_movie.get('imdb_rating',0)}. Available on: {tmdb_movie.get('streaming','Unknown')}. "
-                        f"Length: {tmdb_movie.get('runtime_min',0)} minutes."
-                    )
+                    context_blocks.append(format_movie_info(tmdb_movie))
                     continue
             if found_in_db:
-                context_blocks.append(
-                    f"{found_in_db.get('title','N/A')} ({found_in_db.get('year','?')}): {found_in_db.get('description','')}. "
-                    f"Director: {found_in_db.get('director','')}. Cast: {', '.join(found_in_db.get('cast', []) if isinstance(found_in_db.get('cast'), list) else [])}. "
-                    f"Genre: {found_in_db.get('genre','')}. Box Office: {found_in_db.get('box_office','Unknown')}. "
-                    f"IMDb: {found_in_db.get('imdb_rating',0)}. Available on: {found_in_db.get('streaming','Unknown')}. "
-                    f"Length: {found_in_db.get('runtime_min',0)} minutes."
-                )
+                context_blocks.append(format_movie_info(found_in_db))
     # If no explicit titles but year/genre present, use AstraDB first, then TMDB discover
     if not context_blocks and (year or genre):
         db_results = retrieve_relevant_movies(f"{genre or ''} {year or ''}", top_k=5)
         if db_results:
             for m in db_results:
-                context_blocks.append(
-                    f"{m.get('title','N/A')} ({m.get('year','?')}): {m.get('description','')}. "
-                    f"Director: {m.get('director','')}. Cast: {', '.join(m.get('cast', []) if isinstance(m.get('cast'), list) else [])}. "
-                    f"Genre: {m.get('genre','')}. Box Office: {m.get('box_office','Unknown')}. "
-                    f"IMDb: {m.get('imdb_rating',0)}. Available on: {m.get('streaming','Unknown')}. "
-                    f"Length: {m.get('runtime_min',0)} minutes."
-                )
+                context_blocks.append(format_movie_info(m))
         else:
             discovered = tmdb_discover_movies(year=year, genre=genre, platform=platform, top_k=5)
             if discovered:
@@ -376,6 +358,23 @@ def update_preferences(session, movie_info):
     if director:
         prefs["directors"].add(director)
 
+# --- Constants for genres and platforms ---
+GENRES = [
+    'Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy',
+    'History', 'Horror', 'Music', 'Mystery', 'Romance', 'Science Fiction', 'TV Movie', 'Thriller', 'War', 'Western'
+]
+PLATFORMS = ['Netflix', 'Prime', 'Hulu', 'Disney', 'HBO', 'Apple TV', 'Peacock']
+
+# --- Utility for formatting movie info ---
+def format_movie_info(movie):
+    return (
+        f"{movie.get('title','N/A')} ({movie.get('year','?')}): {movie.get('description','')}. "
+        f"Director: {movie.get('director','')}. Cast: {', '.join(movie.get('cast', [])) if isinstance(movie.get('cast'), list) else movie.get('cast','')}. "
+        f"Genre: {movie.get('genre','')}. Box Office: {movie.get('box_office','Unknown')}. "
+        f"IMDb: {movie.get('imdb_rating',0)}. Available on: {movie.get('streaming','Unknown')}. "
+        f"Length: {movie.get('runtime_min',0)} minutes."
+    )
+
 def recommend_movies(session, top_k=3):
     # Hybrid: Try AstraDB, then TMDB discover
     prefs = session.get("preferences", {})
@@ -391,9 +390,24 @@ def recommend_movies(session, top_k=3):
         results = retrieve_relevant_movies(query, top_k=top_k)
     except Exception:
         results = []
-    if not results:
-        # Fallback: TMDB discover
-        return tmdb_discover_movies(top_k=top_k)
+    # Fallback: TMDB discover if not enough results
+    if not results or len(results) < top_k:
+        tmdb_results = tmdb_discover_movies(top_k=top_k)
+        # Deduplicate by title+year
+        seen = set((str(m.get('title','')).lower(), str(m.get('year',''))) for m in results)
+        deduped = results[:]
+        for m in tmdb_results:
+            key = (str(m.get('title','')).lower(), str(m.get('year','')))
+            if key not in seen:
+                deduped.append(m)
+                seen.add(key)
+        # Add explanation for fallback
+        if not results:
+            session['recommendation_note'] = "I couldn't find enough matches in my database, so here are some popular movies from TMDB:"
+        else:
+            session['recommendation_note'] = "Here are some additional movies from TMDB:"
+        return deduped[:top_k]
+    session['recommendation_note'] = "Here are some recommendations based on your preferences:"
     return results
 
 def is_valid_email(email):
