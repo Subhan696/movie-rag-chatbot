@@ -1,27 +1,45 @@
-# 📦 Import necessary libraries
+# -*- coding: utf-8 -*-
+# 📦 Improved Hollywood Movie Chatbot (AstraDB + TMDB + Gemini)
+
 import os
-import pandas as pd
-import google.generativeai as genai  # ✅ Gemini SDK
-from dotenv import load_dotenv
-import gradio as gr
-from typing import List, Dict, Any
-import requests  # For TMDB API
+import time
+import math
 import csv
 import re
-import concurrent.futures  # For parallel TMDB API calls
+import json
+import difflib
+import logging
+import concurrent.futures
+from typing import List, Dict, Any, Optional, Tuple
+
+import requests
+import pandas as pd
+import gradio as gr
+from dotenv import load_dotenv
 
 # Vector search client
 from astrapy import DataAPIClient
 
-# 🔷 Load env and Gemini
+# Gemini
+import google.generativeai as genai
+
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# ----------------------------
+# Env & SDKs
+# ----------------------------
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY in .env")
+genai.configure(api_key=GEMINI_API_KEY)
 
-# 📁 Paths
-EXCEL_FILE = "user_info.xlsx"
-FEEDBACK_FILE = "chatbot_feedback.csv"
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+TMDB_API_URL = "https://api.themoviedb.org/3"
 
-# 🔷 AstraDB connection
 ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT", "")
 ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN", "")
 if not ASTRA_DB_API_ENDPOINT or not ASTRA_DB_APPLICATION_TOKEN:
@@ -31,266 +49,368 @@ client = DataAPIClient(ASTRA_DB_APPLICATION_TOKEN)
 database = client.get_database(ASTRA_DB_API_ENDPOINT)
 collection = database.get_collection("movies")
 
-# Embedding model info
+# ----------------------------
+# Files
+# ----------------------------
+EXCEL_FILE = "user_info.xlsx"
+FEEDBACK_FILE = "chatbot_feedback.csv"
+
+# ----------------------------
+# Embeddings
+# ----------------------------
 EMBEDDING_MODEL = "text-embedding-004"
 VECTOR_DIMENSION = 768
 
-def embed_text(text: str) -> List[float]:
+def embed_text(text: str) -> Optional[List[float]]:
     """Get Gemini embedding vector for user query or document text."""
-    res = genai.embed_content(model=EMBEDDING_MODEL, content=(text or ""))
-    emb = res.get("embedding") if isinstance(res, dict) else getattr(res, "embedding", None)
-    if isinstance(emb, dict) and "values" in emb:
-        return emb["values"]
-    return emb
-
-def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> list:
-    # Restore AstraDB logic for hybrid approach
-    ok, err = check_astradb_config()
-    if not ok:
-        return [{"error": err}]
+    text = (text or "").strip()
+    if not text:
+        return None
     try:
-        query_embedding = embed_text(user_query)
-        if not isinstance(query_embedding, list):
-            return []
+        res = genai.embed_content(model=EMBEDDING_MODEL, content=text)
+        emb = res.get("embedding") if isinstance(res, dict) else getattr(res, "embedding", None)
+        if isinstance(emb, dict) and "values" in emb:
+            return emb["values"]
+        return emb
+    except Exception as e:
+        logging.exception("Embedding failed: %s", e)
+        return None
+
+# ----------------------------
+# HTTP helpers (retry/backoff)
+# ----------------------------
+def http_get(url: str, params: Dict[str, Any], retries: int = 3, timeout: int = 10) -> Optional[requests.Response]:
+    last_err = None
+    for i in range(retries):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            # Handle rate limits
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", "2"))
+                time.sleep(min(wait, 10))
+                continue
+            if 200 <= resp.status_code < 300:
+                return resp
+            last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(0.5 * (i + 1))
+    logging.warning("http_get failed for %s | params=%s | err=%s", url, params, last_err)
+    return None
+
+# ----------------------------
+# Normalization & NLP
+# ----------------------------
+PLATFORMS = ['Netflix', 'Prime', 'Hulu', 'Disney', 'HBO', 'Max', 'Apple TV', 'Peacock', 'Paramount+']
+GENRES = [
+    'Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy',
+    'History', 'Horror', 'Music', 'Mystery', 'Romance', 'Science Fiction', 'TV Movie', 'Thriller', 'War', 'Western'
+]
+
+def normalize_title(t: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9: '\-]", " ", (t or "").strip())).strip().lower()
+
+def clean_freeform_to_title(text: str) -> str:
+    text = text or ""
+    # Remove common prefixes
+    text = re.sub(r"(?i)\b(tell me about|details of|info on|information on|who.*directed|cast of|where can i watch)\b", "", text)
+    text = re.sub(r"(?i)\bmovie\b", "", text)
+    text = text.strip()
+    return text
+
+def extract_year(text: str) -> Optional[str]:
+    m = re.search(r"(19|20)\d{2}", text or "")
+    return m.group(0) if m else None
+
+def extract_platform(text: str) -> Optional[str]:
+    for p in PLATFORMS:
+        if p.lower() in (text or "").lower():
+            # Normalize HBO/HBO Max to Max (TMDB nowadays uses "Max")
+            return "Max" if p.lower().startswith("hbo") else p
+    return None
+
+def extract_genre(text: str) -> Optional[str]:
+    for g in GENRES:
+        if g.lower() in (text or "").lower():
+            return g
+    return None
+
+def extract_titles(text: str) -> List[str]:
+    text = text or ""
+    # Quoted titles
+    quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
+    titles = [q[0] or q[1] for q in quoted if q[0] or q[1]]
+
+    # Capitalized phrases (loose heuristic)
+    for phrase in re.findall(r'([A-Z][a-zA-Z0-9: \'\-]+)', text):
+        if len(phrase.split()) > 1 and phrase not in titles:
+            titles.append(phrase.strip())
+
+    # Fallback to cleaned freeform
+    cleaned = clean_freeform_to_title(text)
+    if cleaned and cleaned not in titles and len(cleaned.split()) <= 6:
+        titles.append(cleaned)
+
+    # Dedup
+    seen, out = set(), []
+    for t in titles:
+        n = normalize_title(t)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(t.strip())
+    return out[:3]
+
+# ----------------------------
+# AstraDB retrieval & upsert
+# ----------------------------
+def retrieve_relevant_movies(user_query: str, top_k: int = 5) -> List[dict]:
+    if not user_query:
+        return []
+    query_embedding = embed_text(user_query)
+    if not isinstance(query_embedding, list):
+        return []
+    try:
         results = collection.find(
             {},
             sort={"$vector": query_embedding},
             limit=top_k,
-            include_similarity=True,
+            include_similarity=True
         )
         return list(results)
     except Exception as e:
-        return [{"error": f"AstraDB error: {str(e)}"}]
+        logging.exception("AstraDB error: %s", e)
+        return []
 
-# --- API Config Checks ---
-def check_astradb_config():
-    if not ASTRA_DB_API_ENDPOINT or not ASTRA_DB_APPLICATION_TOKEN:
-        return False, "AstraDB configuration is missing. Please set ASTRA_DB_API_ENDPOINT and ASTRA_DB_APPLICATION_TOKEN in your .env file."
-    return True, None
+def upsert_movie_into_astra(m: dict):
+    """Upsert a movie doc (with vector) so next time Astra can hit it fast."""
+    try:
+        title = m.get("title") or ""
+        year = str(m.get("year") or "")
+        doc_id = f"{normalize_title(title)}_{year}"
+        text_blob = format_movie_info(m)
+        vec = embed_text(text_blob)
+        doc = {
+            "_id": doc_id,
+            "title": title,
+            "year": year,
+            "description": m.get("description", ""),
+            "director": m.get("director", ""),
+            "cast": m.get("cast", []),
+            "genre": m.get("genre", ""),
+            "box_office": m.get("box_office", "Unknown"),
+            "imdb_rating": m.get("imdb_rating", 0),
+            "runtime_min": m.get("runtime_min", 0),
+            "streaming": m.get("streaming", "Unknown"),
+            "$vector": vec if isinstance(vec, list) else None,
+        }
+        # Remove None vector if embedding failed (still store doc)
+        if doc["$vector"] is None:
+            doc.pop("$vector", None)
+        collection.update_one({"_id": doc_id}, {"$set": doc}, upsert=True)
+    except Exception as e:
+        logging.warning("Upsert into Astra failed: %s", e)
 
-def check_tmdb_config():
+# ----------------------------
+# TMDB fetchers (parallel & robust)
+# ----------------------------
+def tmdb_search_movie(query: str, year: Optional[str] = None) -> List[dict]:
     if not TMDB_API_KEY:
-        return False, "TMDB API key is missing. Please set TMDB_API_KEY in your .env file."
-    return True, None
+        return []
+    url = f"{TMDB_API_URL}/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": query}
+    if year:
+        params["year"] = year
+    resp = http_get(url, params)
+    if not resp:
+        return []
+    return resp.json().get("results", []) or []
 
-def check_gemini_config():
-    if not os.getenv("GEMINI_API_KEY"):
-        return False, "Gemini API key is missing. Please set GEMINI_API_KEY in your .env file."
-    return True, None
+def tmdb_movie_details(movie_id: int) -> Optional[dict]:
+    if not TMDB_API_KEY:
+        return None
+    url = f"{TMDB_API_URL}/movie/{movie_id}"
+    params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
+    resp = http_get(url, params)
+    if not resp:
+        return None
+    return resp.json()
 
-def extract_movie_titles(text):
-    """Extract likely movie titles from user input using capitalization, known patterns, and TMDB fuzzy search as fallback."""
-    # Look for quoted titles
-    quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
-    titles = [q[0] or q[1] for q in quoted if q[0] or q[1]]
-    # Also look for capitalized phrases (simple heuristic)
-    cap_phrases = re.findall(r'([A-Z][a-zA-Z0-9: \'\-]+)', text)
-    for phrase in cap_phrases:
-        if len(phrase.split()) > 1 and phrase not in titles:
-            titles.append(phrase.strip())
-    # Remove duplicates, preserve order
-    seen = set()
-    result = []
-    for t in titles:
-        if t not in seen:
-            seen.add(t)
-            result.append(t)
-    # Fallback: If nothing found, try TMDB search for fuzzy match
-    if not result and TMDB_API_KEY:
-        search_url = f"{TMDB_API_URL}/search/movie"
-        params = {"api_key": TMDB_API_KEY, "query": text}
-        try:
-            resp = requests.get(search_url, params=params)
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    # Return top 1-2 matches
-                    for m in results[:2]:
-                        title = m.get("title")
-                        if title and title not in result:
-                            result.append(title)
-        except Exception:
-            pass
-    return result
+def tmdb_watch_providers(movie_id: int, region: str = "US") -> dict:
+    if not TMDB_API_KEY:
+        return {}
+    url = f"{TMDB_API_URL}/movie/{movie_id}/watch/providers"
+    params = {"api_key": TMDB_API_KEY}
+    resp = http_get(url, params)
+    if not resp:
+        return {}
+    return (resp.json() or {}).get("results", {}).get(region, {}) or {}
 
-def extract_year_and_platform(text):
-    """Extract year and streaming platform from user input."""
-    year = None
-    platform = None
-    # Look for a 4-digit year
-    m = re.search(r'(19|20)\d{2}', text)
-    if m:
-        year = m.group(0)
-    # Look for common streaming platforms
-    platforms = ['Netflix', 'Prime', 'Hulu', 'Disney', 'HBO', 'Apple TV', 'Peacock']
-    for p in platforms:
-        if p.lower() in text.lower():
-            platform = p
-            break
-    return year, platform
-
-def extract_genre(text):
-    """Extract a likely genre from user input."""
-    # List of common genres in TMDB
-    genres = [
-        'Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy',
-        'History', 'Horror', 'Music', 'Mystery', 'Romance', 'Science Fiction', 'TV Movie', 'Thriller', 'War', 'Western'
-    ]
-    for g in genres:
-        if g.lower() in text.lower():
-            return g
+def fetch_streaming_match(movie_ids: List[int], platform: Optional[str], region: str = "US") -> Optional[int]:
+    """Return the first movie_id available on given platform (if provided)."""
+    if not platform:
+        return movie_ids[0] if movie_ids else None
+    platform_norm = platform.lower()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(tmdb_watch_providers, mid, region): mid for mid in movie_ids}
+        for fut in concurrent.futures.as_completed(futs):
+            mid = futs[fut]
+            providers = fut.result() or {}
+            flatrate = providers.get("flatrate", []) or []
+            if any(platform_norm in (p.get("provider_name", "").lower()) for p in flatrate):
+                return mid
     return None
 
-# TMDB API setup
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
-TMDB_API_URL = "https://api.themoviedb.org/3"
+def pick_best_title(results: List[dict], target_title: str) -> dict:
+    """Pick best TMDB result by fuzzy title match (and popularity as tie-breaker)."""
+    if not results:
+        return {}
+    names = [r.get("title", "") for r in results]
+    best = difflib.get_close_matches(target_title, names, n=1, cutoff=0.6)
+    if best:
+        name = best[0]
+        for r in results:
+            if r.get("title") == name:
+                return r
+    # fallback: most popular
+    return sorted(results, key=lambda r: r.get("popularity", 0), reverse=True)[0]
 
-def fetch_movie_details_parallel(movie_ids):
-    """Fetch movie details in parallel for a list of TMDB movie IDs."""
-    def fetch_details(mid):
-        details_url = f"{TMDB_API_URL}/movie/{mid}"
-        details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
-        try:
-            resp = requests.get(details_url, params=details_params)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            pass
-        return None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(fetch_details, movie_ids))
-    return results
+def fetch_movie_from_tmdb(query: str, year: Optional[str] = None, platform: Optional[str] = None, region: str = "US") -> dict:
+    if not TMDB_API_KEY:
+        return {"error": "TMDB API key is missing. Please set TMDB_API_KEY in your .env file."}
+    query = (query or "").strip()
+    if not query:
+        return {"error": "Empty query."}
 
-def fetch_streaming_providers_parallel(movie_ids, platform):
-    """Fetch streaming provider info in parallel for a list of TMDB movie IDs."""
-    def fetch_provider(mid):
-        prov_url = f"{TMDB_API_URL}/movie/{mid}/watch/providers"
-        prov_params = {"api_key": TMDB_API_KEY}
-        try:
-            resp = requests.get(prov_url, params=prov_params)
-            if resp.status_code == 200:
-                prov_data = resp.json().get("results", {})
-                us = prov_data.get("US", {})
-                flatrate = us.get("flatrate", [])
-                if any(platform.lower() in p.get("provider_name", "").lower() for p in flatrate):
-                    return True
-        except Exception:
-            pass
-        return False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(fetch_provider, movie_ids))
-    return results
+    # Search
+    results = tmdb_search_movie(query, year)
+    if not results:
+        # retry with cleaned query
+        cleaned = clean_freeform_to_title(query)
+        if cleaned != query:
+            results = tmdb_search_movie(cleaned, year)
+    if not results:
+        return {"error": "No results found in TMDB."}
 
-def fetch_movie_from_tmdb(query: str, year: str = None, platform: str = None) -> dict:
-    ok, err = check_tmdb_config()
-    if not ok:
-        return {"error": err}
-    try:
-        search_url = f"{TMDB_API_URL}/search/movie"
-        params = {"api_key": TMDB_API_KEY, "query": query}
-        if year:
-            params["year"] = year
-        resp = requests.get(search_url, params=params)
-        if resp.status_code != 200:
-            return {"error": f"TMDB search error: {resp.status_code}"}
-        results = resp.json().get("results", [])
-        if not results:
-            return {"error": "No results found in TMDB."}
-        # If platform is specified, filter by streaming provider (using TMDB watch/providers API) in parallel
-        if platform:
-            movie_ids = [movie['id'] for movie in results]
-            provider_matches = fetch_streaming_providers_parallel(movie_ids, platform)
-            for idx, match in enumerate(provider_matches):
-                if match:
-                    results[idx]["streaming"] = platform
-                    movie = results[idx]
-                    break
-            else:
-                return {"error": f"No movie found on {platform}."}
-        else:
-            movie = results[0]
-        # Fetch details for the selected movie
-        details_url = f"{TMDB_API_URL}/movie/{movie['id']}"
-        details_params = {"api_key": TMDB_API_KEY, "append_to_response": "credits"}
-        details_resp = requests.get(details_url, params=details_params)
-        if details_resp.status_code != 200:
-            return {"error": f"TMDB details error: {details_resp.status_code}"}
-        details = details_resp.json()
-        director = ""
-        cast = []
-        for member in details.get("credits", {}).get("crew", []):
-            if member.get("job") == "Director":
-                director = member.get("name")
-                break
-        for actor in details.get("credits", {}).get("cast", [])[:5]:
-            cast.append(actor.get("name"))
-        return {
-            "title": details.get("title", movie.get("title")),
-            "year": details.get("release_date", "?")[:4],
-            "description": details.get("overview", movie.get("overview", "")),
-            "director": director,
-            "cast": cast,
-            "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
-            "box_office": details.get("revenue", "Unknown"),
-            "imdb_rating": details.get("vote_average", 0),
-            "runtime_min": details.get("runtime", 0),
-            "streaming": movie.get("streaming", "Unknown")
-        }
-    except Exception as e:
-        return {"error": f"TMDB error: {str(e)}"}
+    # If platform is specified, find first result available there
+    if platform:
+        mid = fetch_streaming_match([r["id"] for r in results], platform, region=region)
+        if not mid:
+            return {"error": f"No movie found on {platform}."}
+        base = next((r for r in results if r["id"] == mid), results[0])
+    else:
+        base = pick_best_title(results, query)
 
-def tmdb_discover_movies(year=None, genre=None, platform=None, top_k=5):
-    ok, err = check_tmdb_config()
-    if not ok:
-        return [{"error": err}]
-    discover_url = f"{TMDB_API_URL}/discover/movie"
+    details = tmdb_movie_details(base["id"])
+    if not details:
+        return {"error": "Failed to fetch details from TMDB."}
+
+    # Parse details
+    director = ""
+    cast = []
+    for member in (details.get("credits", {}) or {}).get("crew", []):
+        if member.get("job") == "Director":
+            director = member.get("name") or ""
+            break
+    for actor in (details.get("credits", {}) or {}).get("cast", [])[:5]:
+        name = actor.get("name")
+        if name:
+            cast.append(name)
+
+    # Providers (best effort, even if platform not specified)
+    providers = tmdb_watch_providers(details["id"], region=region) or {}
+    flatrate = providers.get("flatrate", []) or []
+    stream_names = ", ".join(sorted({p.get("provider_name", "") for p in flatrate if p.get("provider_name")})) or "Unknown"
+
+    movie = {
+        "title": details.get("title", base.get("title", "N/A")),
+        "year": (details.get("release_date", "") or "?")[:4] or "?",
+        "description": details.get("overview", base.get("overview", "")) or "",
+        "director": director,
+        "cast": cast,
+        "genre": ", ".join([g.get("name", "") for g in (details.get("genres") or []) if g.get("name")]),
+        "box_office": details.get("revenue", "Unknown"),
+        "imdb_rating": details.get("vote_average", 0),
+        "runtime_min": details.get("runtime", 0),
+        "streaming": stream_names
+    }
+    # Cache to Astra
+    upsert_movie_into_astra(movie)
+    return movie
+
+def tmdb_discover_movies(year: Optional[str] = None, genre: Optional[str] = None, top_k: int = 5, region: str = "US") -> List[dict]:
+    if not TMDB_API_KEY:
+        return []
+    genre_map = {
+        'Action': 28, 'Adventure': 12, 'Animation': 16, 'Comedy': 35, 'Crime': 80, 'Documentary': 99,
+        'Drama': 18, 'Family': 10751, 'Fantasy': 14, 'History': 36, 'Horror': 27, 'Music': 10402,
+        'Mystery': 9648, 'Romance': 10749, 'Science Fiction': 878, 'TV Movie': 10770, 'Thriller': 53,
+        'War': 10752, 'Western': 37
+    }
     params = {"api_key": TMDB_API_KEY, "sort_by": "popularity.desc", "page": 1}
     if year:
         params["year"] = year
-    if genre:
-        genre_map = {
-            'Action': 28, 'Adventure': 12, 'Animation': 16, 'Comedy': 35, 'Crime': 80, 'Documentary': 99,
-            'Drama': 18, 'Family': 10751, 'Fantasy': 14, 'History': 36, 'Horror': 27, 'Music': 10402,
-            'Mystery': 9648, 'Romance': 10749, 'Science Fiction': 878, 'TV Movie': 10770, 'Thriller': 53,
-            'War': 10752, 'Western': 37
-        }
-        genre_id = genre_map.get(genre)
-        if genre_id:
-            params["with_genres"] = genre_id
-    resp = requests.get(discover_url, params=params)
-    if resp.status_code != 200:
-        return [{"error": f"TMDB discover error: {resp.status_code}"}]
-    movies = resp.json().get("results", [])[:top_k]
-    # Fetch details in parallel for all movies
-    movie_ids = [m['id'] for m in movies]
-    details_list = fetch_movie_details_parallel(movie_ids)
-    results = []
-    for m, details in zip(movies, details_list):
-        if not details:
-            continue
+    if genre and genre_map.get(genre):
+        params["with_genres"] = genre_map[genre]
+
+    url = f"{TMDB_API_URL}/discover/movie"
+    resp = http_get(url, params)
+    if not resp:
+        return []
+    movies = (resp.json().get("results", []) or [])[:top_k]
+    ids = [m["id"] for m in movies]
+
+    # Parallel details
+    def fetch(mid):
+        d = tmdb_movie_details(mid)
+        if not d:
+            return None
         director = ""
         cast = []
-        for member in details.get("credits", {}).get("crew", []):
+        for member in (d.get("credits", {}) or {}).get("crew", []):
             if member.get("job") == "Director":
-                director = member.get("name")
+                director = member.get("name") or ""
                 break
-        for actor in details.get("credits", {}).get("cast", [])[:5]:
-            cast.append(actor.get("name"))
-        results.append({
-            "title": details.get("title", m.get("title")),
-            "year": details.get("release_date", "?")[:4],
-            "description": details.get("overview", m.get("overview", "")),
+        for actor in (d.get("credits", {}) or {}).get("cast", [])[:5]:
+            if actor.get("name"):
+                cast.append(actor["name"])
+        providers = tmdb_watch_providers(mid, region=region) or {}
+        flatrate = providers.get("flatrate", []) or []
+        stream_names = ", ".join(sorted({p.get("provider_name", "") for p in flatrate if p.get("provider_name")})) or "Unknown"
+        movie = {
+            "title": d.get("title", ""),
+            "year": (d.get("release_date", "") or "?")[:4] or "?",
+            "description": d.get("overview", ""),
             "director": director,
             "cast": cast,
-            "genre": ", ".join([g["name"] for g in details.get("genres", [])]),
-            "box_office": details.get("revenue", "Unknown"),
-            "imdb_rating": details.get("vote_average", 0),
-            "runtime_min": details.get("runtime", 0),
-            "streaming": m.get("streaming", "Unknown")
-        })
-    return results
+            "genre": ", ".join([g.get("name", "") for g in (d.get("genres") or []) if g.get("name")]),
+            "box_office": d.get("revenue", "Unknown"),
+            "imdb_rating": d.get("vote_average", 0),
+            "runtime_min": d.get("runtime", 0),
+            "streaming": stream_names
+        }
+        upsert_movie_into_astra(movie)
+        return movie
 
-# 🔷 Session state
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        details = list(ex.map(fetch, ids))
+
+    return [m for m in details if m]
+
+# ----------------------------
+# Formatting
+# ----------------------------
+def format_movie_info(movie: dict) -> str:
+    return (
+        f"{movie.get('title','N/A')} ({movie.get('year','?')}): {movie.get('description','').strip()} "
+        f"Director: {movie.get('director','')}. Cast: {', '.join(movie.get('cast', [])) if isinstance(movie.get('cast'), list) else movie.get('cast','')}. "
+        f"Genre: {movie.get('genre','')}. Box Office: {movie.get('box_office','Unknown')}. "
+        f"IMDb: {round(float(movie.get('imdb_rating',0)), 1) if movie.get('imdb_rating') else 0}. "
+        f"Available on: {movie.get('streaming','Unknown')}. Length: {movie.get('runtime_min',0)} minutes."
+    )
+
+# ----------------------------
+# Session / State
+# ----------------------------
 def init_session():
     return {
         "name": None, "phone": None, "email": None, "location": None,
@@ -298,17 +418,21 @@ def init_session():
         "chat_history": [],
         "first_prompt": True,
         "last_movie": None,
-        "last_movie_context": None,
-        "preferences": {"genres": set(), "actors": set(), "directors": set()}
+        "last_movie_doc": None,   # full dict for follow-ups
+        "preferences": {"genres": [], "actors": [], "directors": []},  # use lists (Gradio-safe)
+        "region": "US",  # default; could infer from location later
+        "recommendation_note": ""
     }
 
-# 🔷 Save user info
+# ----------------------------
+# Save user info & feedback
+# ----------------------------
 def save_user_info(session):
     user_info = {
-        "Name": session["name"],
-        "Phone": session["phone"],
-        "Email": session["email"],
-        "Location": session["location"]
+        "Name": session.get("name"),
+        "Phone": session.get("phone"),
+        "Email": session.get("email"),
+        "Location": session.get("location")
     }
     if os.path.exists(EXCEL_FILE):
         df = pd.read_excel(EXCEL_FILE)
@@ -317,9 +441,7 @@ def save_user_info(session):
         df = pd.DataFrame([user_info])
     df.to_excel(EXCEL_FILE, index=False)
 
-# 🔷 Save feedback
 def save_feedback(user, message, response, rating, comment=None):
-    """Save feedback to a CSV file."""
     row = {
         "User": user,
         "Message": message,
@@ -334,20 +456,17 @@ def save_feedback(user, message, response, rating, comment=None):
             writer.writeheader()
         writer.writerow(row)
 
-# 🔷 Gemini query using full chat history + personalization
-def query_gpt(user_query, session):
-    ok, err = check_gemini_config()
-    if not ok:
-        return err
-    user_name = session.get("name", "User")
-    user_location = session.get("location", "their location")
+# ----------------------------
+# LLM query (Gemini) with RAG context
+# ----------------------------
+def query_llm(user_query: str, session: dict, context_blocks: List[str]) -> str:
+    user_name = session.get("name", "there")
+    user_location = session.get("location", "your area")
 
     system_message = (
-        f"You are a friendly and helpful assistant answering questions about Hollywood movies. "
-        f"The user you're helping is named {user_name} from {user_location}. "
-        f"Make your responses conversational and, when natural, refer to them by name. "
-        f"Use only the retrieved movie data unless asked general knowledge. "
-        f"Refer to chat history to keep continuity in your responses."
+        f"You are a friendly assistant about Hollywood movies. "
+        f"The user is {user_name} from {user_location}. Keep responses conversational and concise. "
+        f"Use ONLY the provided context for facts unless asked general knowledge."
     )
 
     recent_history = session["chat_history"][-5:]
@@ -356,256 +475,256 @@ def query_gpt(user_query, session):
         role = turn["role"].capitalize()
         history_text += f"{role}: {turn['content']}\n"
 
-    context_blocks = []
-    year, platform = extract_year_and_platform(user_query)
-    genre = extract_genre(user_query)
-    movie_titles = extract_movie_titles(user_query)
-    # If explicit movie titles, try AstraDB first, then TMDB if missing/empty
-    if movie_titles:
-        for title in movie_titles:
-            found_in_db = None
-            for m in retrieve_relevant_movies(title, top_k=1):
-                if title.lower() == str(m.get('title', '')).lower():
-                    found_in_db = m
-                    break
-            # Check if DB result is missing key info
-            missing_info = (
-                not found_in_db or
-                not found_in_db.get('description') or
-                not found_in_db.get('director') or
-                not found_in_db.get('cast')
-            )
-            if missing_info:
-                tmdb_movie = fetch_movie_from_tmdb(title, year=year, platform=platform)
-                if tmdb_movie:
-                    context_blocks.append(format_movie_info(tmdb_movie))
-                    continue
-            if found_in_db:
-                context_blocks.append(format_movie_info(found_in_db))
-    # If no explicit titles but year/genre present, use AstraDB first, then TMDB discover
-    if not context_blocks and (year or genre):
-        db_results = retrieve_relevant_movies(f"{genre or ''} {year or ''}", top_k=5)
-        if db_results:
-            for m in db_results:
-                context_blocks.append(format_movie_info(m))
-        else:
-            discovered = tmdb_discover_movies(year=year, genre=genre, platform=platform, top_k=5)
-            if discovered:
-                context_blocks.append("Here are some movies I found:")
-                for m in discovered:
-                    context_blocks.append(f"- {m['title']} ({m['year']}): {m['description'][:100]}...")
-    if not context_blocks:
-        context_blocks.append("(No relevant movies found in DB or TMDB for your query.)")
-    movie_context = "\n".join(context_blocks)
+    movie_context = "\n".join(context_blocks) if context_blocks else "(No relevant context.)"
 
     prompt = (
         f"{system_message}\n\n"
         f"### CHAT HISTORY:\n{history_text}\n"
-        f"### RETRIEVED MOVIES:\n{movie_context}\n"
-        f"### USER QUESTION:\n{user_query}"
+        f"### CONTEXT:\n{movie_context}\n"
+        f"### USER QUESTION:\n{user_query}\n"
+        f"Answer helpfully. If the user asks a follow-up like runtime/streaming/director, extract it directly from context."
     )
 
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
     try:
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
         response = model.generate_content(prompt)
-        return response.text.strip()
+        return (response.text or "").strip()
     except Exception as e:
-        return f"Sorry {user_name}, I encountered an error while fetching the response. Please try again later."
+        logging.warning("Gemini error: %s", e)
+        return "Sorry, I had trouble generating a response. Try again?"
 
-def update_preferences(session, movie_info):
-    """Update user preferences in session based on movie info."""
+# ----------------------------
+# Preferences
+# ----------------------------
+def safe_add(lst: List[str], items: List[str]):
+    s = set(lst)
+    for x in items:
+        x = (x or "").strip()
+        if x and x not in s:
+            lst.append(x); s.add(x)
+
+def update_preferences(session, movie_info: dict):
     if not movie_info:
         return
-    prefs = session.setdefault("preferences", {"genres": set(), "actors": set(), "directors": set()})
-    # Add genres
+    prefs = session.setdefault("preferences", {"genres": [], "actors": [], "directors": []})
     genres = movie_info.get("genre", "")
     if genres:
-        for g in genres.split(","):
-            prefs["genres"].add(g.strip())
-    # Add actors
-    for actor in movie_info.get("cast", []):
-        prefs["actors"].add(actor)
-    # Add director
-    director = movie_info.get("director", "")
-    if director:
-        prefs["directors"].add(director)
-
-# --- Constants for genres and platforms ---
-GENRES = [
-    'Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy',
-    'History', 'Horror', 'Music', 'Mystery', 'Romance', 'Science Fiction', 'TV Movie', 'Thriller', 'War', 'Western'
-]
-PLATFORMS = ['Netflix', 'Prime', 'Hulu', 'Disney', 'HBO', 'Apple TV', 'Peacock']
-
-# --- Utility for formatting movie info ---
-def format_movie_info(movie):
-    return (
-        f"{movie.get('title','N/A')} ({movie.get('year','?')}): {movie.get('description','')}. "
-        f"Director: {movie.get('director','')}. Cast: {', '.join(movie.get('cast', [])) if isinstance(movie.get('cast'), list) else movie.get('cast','')}. "
-        f"Genre: {movie.get('genre','')}. Box Office: {movie.get('box_office','Unknown')}. "
-        f"IMDb: {movie.get('imdb_rating',0)}. Available on: {movie.get('streaming','Unknown')}. "
-        f"Length: {movie.get('runtime_min',0)} minutes."
-    )
+        safe_add(prefs["genres"], [g.strip() for g in genres.split(",") if g.strip()])
+    safe_add(prefs["actors"], movie_info.get("cast", []))
+    if movie_info.get("director"):
+        safe_add(prefs["directors"], [movie_info["director"]])
 
 def recommend_movies(session, top_k=3):
-    # Hybrid: Try AstraDB, then TMDB discover
+    # Try Astra based on preferences; fallback TMDB discover
     prefs = session.get("preferences", {})
     query_parts = []
     if prefs.get("genres"):
-        query_parts.append(f"genre: {', '.join(list(prefs['genres']))}")
+        query_parts.append("genre: " + ", ".join(prefs["genres"]))
     if prefs.get("actors"):
-        query_parts.append(f"cast: {', '.join(list(prefs['actors']))}")
+        query_parts.append("cast: " + ", ".join(prefs["actors"]))
     if prefs.get("directors"):
-        query_parts.append(f"director: {', '.join(list(prefs['directors']))}")
+        query_parts.append("director: " + ", ".join(prefs["directors"]))
     query = ", ".join(query_parts) if query_parts else "popular movies"
-    try:
-        results = retrieve_relevant_movies(query, top_k=top_k)
-    except Exception:
-        results = []
-    # Fallback: TMDB discover if not enough results
-    if not results or len(results) < top_k:
-        tmdb_results = tmdb_discover_movies(top_k=top_k)
-        # Deduplicate by title+year
+
+    results = retrieve_relevant_movies(query, top_k=top_k) or []
+    results = [r for r in results if isinstance(r, dict)]
+    if len(results) < top_k:
+        tmdb_more = tmdb_discover_movies(top_k=top_k, region=session.get("region", "US"))
+        # Dedup by title+year
         seen = set((str(m.get('title','')).lower(), str(m.get('year',''))) for m in results)
-        deduped = results[:]
-        for m in tmdb_results:
+        for m in tmdb_more:
             key = (str(m.get('title','')).lower(), str(m.get('year','')))
             if key not in seen:
-                deduped.append(m)
+                results.append(m)
                 seen.add(key)
-        # Add explanation for fallback
-        if not results:
-            session['recommendation_note'] = "I couldn't find enough matches in my database, so here are some popular movies from TMDB:"
-        else:
-            session['recommendation_note'] = "Here are some additional movies from TMDB:"
-        return deduped[:top_k]
-    session['recommendation_note'] = "Here are some recommendations based on your preferences:"
-    return results
+        session['recommendation_note'] = "Here are some popular picks:"
+    else:
+        session['recommendation_note'] = "Recommendations based on your taste:"
+    return results[:top_k]
 
-def is_valid_email(email):
-    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email)
+# ----------------------------
+# Intent: follow-up detection
+# ----------------------------
+FOLLOWUP_REGEX = re.compile(
+    r"(who (directed|is the director)|who (starred|acted)|cast|box office|genre|how long|runtime|where can i (watch|stream)|on (netflix|prime|hulu|max|disney|peacock|apple tv))",
+    re.I
+)
 
-def is_valid_phone(phone):
-    return re.match(r"^\+?\d{7,15}$", phone)
+def is_followup_intent(user_input: str) -> bool:
+    if FOLLOWUP_REGEX.search(user_input or ""):
+        return True
+    # quick pronoun heuristic
+    if re.search(r"\b(it|this|that)\b", user_input or "", re.I):
+        return True
+    return False
 
-def is_followup_intent(user_input, session):
-    """Use Gemini to classify if the user input is a follow-up/ambiguous query."""
-    try:
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
-        prompt = (
-            "You are an intent classifier for a movie chatbot. "
-            "Given the user's message and recent chat history, answer only 'yes' if the message is a follow-up (e.g., refers to 'it', 'that', 'this', or asks about director, cast, box office, genre, runtime, or streaming info of a previously discussed movie), otherwise answer 'no'.\n"
-            f"User message: {user_input}\n"
-            f"Recent chat history: {session['chat_history'][-3:] if session.get('chat_history') else ''}"
-        )
-        response = model.generate_content(prompt)
-        return response.text.strip().lower().startswith('yes')
-    except Exception:
-        # Fallback to regex if Gemini fails
-        followup_patterns = [
-            r"who (directed|is the director)",
-            r"who (starred|acted|is in it)",
-            r"what (is|was) the box office",
-            r"what (is|was) the genre",
-            r"how long (is|was) it",
-            r"where can i watch|stream (it|this|that)",
-            r"(it|this|that)"
-        ]
-        return any(re.search(pat, user_input, re.I) for pat in followup_patterns)
+# ----------------------------
+# Input handler
+# ----------------------------
+def handle_input(user_input: str, session: dict) -> Tuple[str, dict]:
+    user_input = (user_input or "").strip()
+    user_input_lower = user_input.lower()
 
-# 🔷 Handle input from user
-def handle_input(user_input, session):
-    user_input_lower = user_input.strip().lower()
-    # Allow user to update info at any time
+    # Allow info reset
     if user_input_lower in ["update my info", "change my info", "edit my info"]:
-        session["collected"] = False
-        session["name"] = None
-        session["phone"] = None
-        session["email"] = None
-        session["location"] = None
+        session.update(init_session())
+        session["first_prompt"] = False  # jump straight into collection
         return "Let's update your information. May I have your name, please?", session
 
     if session["first_prompt"]:
         session["first_prompt"] = False
         return (
-            "Hello! \U0001F44B\nMay I have your name, please?\n\n"
-            "*Privacy Notice: Your name, phone, email, and location are stored in a local file for personalization. "
-            "You may skip phone/email/location by typing 'skip'.*\n",
+            "Hello! 👋\nMay I have your name, please?\n\n"
+            "*Privacy Notice: Your name, phone, email, and location are stored locally for personalization. "
+            "You can skip phone/email/location by typing 'skip'.*",
             session
         )
 
+    # Collect user info
     if not session["collected"]:
         if not session["name"]:
-            if user_input_lower == "skip" or not user_input.strip():
+            if user_input_lower == "skip" or not user_input:
                 return "Name is required. Please enter your name:", session
-            session["name"] = user_input.strip()
-            return "Thank you, may I have your phone number? (or type 'skip')", session
+            session["name"] = user_input
+            return "Thanks! Your phone number? (or type 'skip')", session
         elif not session["phone"]:
             if user_input_lower == "skip":
                 session["phone"] = "(skipped)"
-                return "Great. May I have your email address? (or type 'skip')", session
-            elif not is_valid_phone(user_input.strip()):
-                return "That doesn't look like a valid phone number. Please enter a valid phone or type 'skip':", session
-            session["phone"] = user_input.strip()
-            return "Great. May I have your email address? (or type 'skip')", session
+            else:
+                if not re.match(r"^\+?\d{7,15}$", user_input):
+                    return "That doesn't look like a valid phone. Enter a valid phone or type 'skip':", session
+                session["phone"] = user_input
+            return "Great. Your email address? (or type 'skip')", session
         elif not session["email"]:
             if user_input_lower == "skip":
                 session["email"] = "(skipped)"
-                return "Thank you. Lastly, may I know your location? (or type 'skip')", session
-            elif not is_valid_email(user_input.strip()):
-                return "That doesn't look like a valid email address. Please enter a valid email or type 'skip':", session
-            session["email"] = user_input.strip()
-            return "Thank you. Lastly, may I know your location? (or type 'skip')", session
-        elif not session["location"]:
-            if user_input_lower == "skip":
-                session["location"] = "(skipped)"
             else:
-                session["location"] = user_input.strip()
-            session["collected"] = True
+                if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", user_input):
+                    return "That doesn't look like a valid email. Enter a valid email or type 'skip':", session
+                session["email"] = user_input
+            return "Lastly, your location (city/country)? (or type 'skip')", session
+        elif not session["location"]:
+            session["location"] = "(skipped)" if user_input_lower == "skip" else user_input
+            # Optional: light region inference (very naive)
+            if isinstance(session["location"], str) and "india" in session["location"].lower():
+                session["region"] = "IN"
             save_user_info(session)
+            session["collected"] = True
             return (
-                f"Awesome, {session['name']} from {session['location']}! \U0001F389\n"
-                f"You can now ask me anything about Hollywood movies — cast, director, box office, or where to stream them. "
-                f"Let's get started! \U0001F37F\n\n*You can update your info anytime by typing 'update my info'.*",
+                f"Awesome, {session['name']} from {session['location']}! 🎉\n"
+                f"Ask me about movies — cast, director, runtime, streaming, or get recommendations. 🍿",
                 session
             )
 
-    # --- Context Awareness: Track last discussed movie ---
-    session.setdefault("last_movie", None)
-    session.setdefault("last_movie_context", None)
-
-    # Add user input to chat history
+    # --- Conversation / RAG ---
     session["chat_history"].append({"role": "user", "content": user_input})
 
-    # Improved follow-up detection
-    is_followup = is_followup_intent(user_input, session)
-    if is_followup and session["last_movie_context"]:
-        # Use last movie context for the answer
-        movie_response = session["last_movie_context"]
-    else:
-        # Normal flow: get response and update last_movie if possible
-        movie_response = query_gpt(user_input, session)
-        # Try to extract the main movie discussed from the response (simple heuristic)
-        m = re.search(r"([A-Za-z0-9: '\-]+) \([0-9]{4}\)", movie_response)
-        if m:
-            session["last_movie"] = m.group(1).strip()
-            session["last_movie_context"] = movie_response
+    # Follow-up handling
+    if is_followup_intent(user_input) and session.get("last_movie_doc"):
+        # Answer directly from last movie doc
+        m = session["last_movie_doc"]
+        # If question is about streaming on specific platform, say yes/no
+        p = extract_platform(user_input)
+        if p:
+            available = [s.strip().lower() for s in (m.get("streaming","") or "").split(",")]
+            msg = f"Yes, it's on {p}." if p.lower() in available else f"I don't see {p} in its providers. Available on: {m.get('streaming','Unknown')}."
+            session["chat_history"].append({"role": "assistant", "content": msg})
+            return msg, session
+        # Other follow-ups → compose a concise answer
+        snippet = []
+        if re.search(r"who (directed|is the director)", user_input, re.I) and m.get("director"):
+            snippet.append(f"Director: {m['director']}")
+        if re.search(r"(who (starred|acted)|cast)", user_input, re.I) and m.get("cast"):
+            snippet.append(f"Cast: {', '.join(m['cast'])}")
+        if re.search(r"(box office)", user_input, re.I) and m.get("box_office") not in (None, "Unknown"):
+            snippet.append(f"Box office: {m['box_office']}")
+        if re.search(r"(genre)", user_input, re.I) and m.get("genre"):
+            snippet.append(f"Genre: {m['genre']}")
+        if re.search(r"(how long|runtime)", user_input, re.I) and m.get("runtime_min"):
+            snippet.append(f"Runtime: {m['runtime_min']} min")
+        if re.search(r"(where can i (watch|stream))", user_input, re.I):
+            snippet.append(f"Streaming: {m.get('streaming','Unknown')}")
+        if snippet:
+            msg = f"{m['title']} ({m['year']}): " + " | ".join(snippet)
+            session["chat_history"].append({"role": "assistant", "content": msg})
+            return msg, session
+        # If we can't parse, fall back to LLM with context
+        ctx = [format_movie_info(m)]
+        msg = query_llm(user_input, session, ctx)
+        session["chat_history"].append({"role": "assistant", "content": msg})
+        return msg, session
 
-    # After getting movie_response, update preferences if a movie was discussed
-    if session.get("last_movie_context"):
-        # Try to extract movie info from last_movie_context (simple heuristic)
-        info = {}
-        ctx = session["last_movie_context"]
-        m = re.search(r"(?P<title>[A-Za-z0-9: '\-]+) \((?P<year>[0-9]{4})\): (?P<desc>.*?)\. Director: (?P<director>[^.]*). Cast: (?P<cast>[^.]*). Genre: (?P<genre>[^.]*).", ctx)
-        if m:
-            info = m.groupdict()
-            info["cast"] = [a.strip() for a in info.get("cast", "").split(",") if a.strip()]
-        update_preferences(session, info)
+    # New query path
+    year = extract_year(user_input)
+    platform = extract_platform(user_input)
+    genre = extract_genre(user_input)
+    titles = extract_titles(user_input)
 
-    session["chat_history"].append({"role": "assistant", "content": movie_response})
-    return movie_response, session
+    context_blocks = []
+    region = session.get("region", "US")
 
-# 🔷 Gradio callbacks
+    if titles:
+        # Try Astra hit first by exact title
+        for t in titles:
+            # Try Astra
+            astra_hits = retrieve_relevant_movies(t, top_k=3)
+            exact = None
+            for m in astra_hits:
+                if normalize_title(m.get("title","")) == normalize_title(t):
+                    exact = m; break
+            if exact:
+                context_blocks.append(format_movie_info(exact))
+                session["last_movie_doc"] = {
+                    "title": exact.get("title"), "year": exact.get("year"),
+                    "description": exact.get("description",""), "director": exact.get("director",""),
+                    "cast": exact.get("cast",[]), "genre": exact.get("genre",""),
+                    "box_office": exact.get("box_office","Unknown"), "imdb_rating": exact.get("imdb_rating",0),
+                    "runtime_min": exact.get("runtime_min",0), "streaming": exact.get("streaming","Unknown")
+                }
+                update_preferences(session, session["last_movie_doc"])
+                break
+            # Else TMDB
+            tm = fetch_movie_from_tmdb(t, year=year, platform=platform, region=region)
+            if "error" not in tm:
+                context_blocks.append(format_movie_info(tm))
+                session["last_movie_doc"] = tm
+                update_preferences(session, tm)
+                break
+
+    if not context_blocks and (year or genre):
+        # Discovery path
+        # Try Astra with combined query
+        astra_ctx = retrieve_relevant_movies(f"{genre or ''} {year or ''}".strip(), top_k=5)
+        if astra_ctx:
+            for m in astra_ctx:
+                context_blocks.append(format_movie_info(m))
+        else:
+            discovered = tmdb_discover_movies(year=year, genre=genre, top_k=5, region=region)
+            for m in discovered:
+                context_blocks.append(format_movie_info(m))
+
+    if not context_blocks and not titles:
+        # Generic recommendations
+        recs = recommend_movies(session, top_k=3)
+        if recs:
+            note = session.get("recommendation_note","Here are some movies you might like:")
+            context_blocks.append(note)
+            for m in recs:
+                context_blocks.append(f"- {m.get('title','N/A')} ({m.get('year','?')}): { (m.get('description','') or '')[:110]}...")
+
+    if not context_blocks:
+        msg = "I couldn’t find a good match. Try giving a movie title, year, genre, or where you want to stream it."
+        session["chat_history"].append({"role": "assistant", "content": msg})
+        return msg, session
+
+    # Generate final answer
+    answer = query_llm(user_input, session, context_blocks)
+    session["chat_history"].append({"role": "assistant", "content": answer})
+    return answer, session
+
+# ----------------------------
+# Gradio Callbacks
+# ----------------------------
 def on_submit(user_message, chat_history, state):
     response, state = handle_input(user_message, state)
     chat_history.append([user_message, response])
@@ -615,22 +734,26 @@ def on_clear():
     return [], "", init_session()
 
 def on_feedback(rating, comment, chat_history, state):
-    # Save feedback for the last exchange
-    if chat_history and len(chat_history) > 0:
+    if chat_history:
         last_user, last_response = chat_history[-1]
         user = state.get("name", "User")
         save_feedback(user, last_user, last_response, rating, comment)
     return chat_history, state
 
-# 🔷 Gradio app
+# ----------------------------
+# UI
+# ----------------------------
 with gr.Blocks() as demo:
-    gr.Markdown("## \U0001F3AC Hollywood Movie Chatbot + User Info")
-    chatbot = gr.Chatbot()
-    msg = gr.Textbox(label="Your Message", placeholder="Hi!")
-    clear = gr.Button("Clear Chat")
+    gr.Markdown("## 🎬 Hollywood Movie Chatbot + User Info (Improved)")
+    chatbot = gr.Chatbot(height=420)
+    with gr.Row():
+        msg = gr.Textbox(label="Your Message", placeholder="Try: where can I stream The Dark Knight (2008)?")
+    with gr.Row():
+        clear = gr.Button("Clear Chat")
+        feedback = gr.Radio(["👍", "👎"], label="Rate the last answer")
+        feedback_comment = gr.Textbox(label="Feedback Comment (optional)", lines=2)
+
     state = gr.State(init_session())
-    feedback = gr.Radio(["👍", "👎"], label="Rate the last answer", visible=True)
-    feedback_comment = gr.Textbox(label="Feedback Comment (optional)", placeholder="Tell us more about your experience...", lines=2)
 
     msg.submit(on_submit, [msg, chatbot, state], [msg, chatbot, state])
     clear.click(on_clear, [], [chatbot, msg, state])
