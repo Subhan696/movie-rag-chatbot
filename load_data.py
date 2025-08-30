@@ -26,16 +26,32 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Dict, Any, List, Optional, Generator
 import time
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Generator, Tuple
+from queue import Queue
+import signal
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry, 
+    stop_after_attempt, 
+    wait_exponential, 
+    retry_if_exception_type,
+    retry_if_result,
+    RetryCallState
+)
 from dotenv import load_dotenv
 from tqdm import tqdm
 import google.generativeai as genai
+from astrapy import DataAPIClient
 from astrapy.info import CollectionDefinition, CollectionVectorOptions
 from astrapy.constants import VectorMetric
+from pydantic import BaseModel, Field, validator
+from ratelimit import limits, sleep_and_retry
 
 try:
     # astrapy >= 1.4
@@ -47,33 +63,55 @@ except Exception as exc:  # pragma: no cover - import-time error messaging
 
 
 # ---------- Configuration ----------
-load_dotenv()
+class Settings(BaseModel):
+    # API Keys
+    gemini_api_key: str = Field(..., env="GEMINI_API_KEY")
+    tmdb_api_key: str = Field(..., env="TMDB_API_KEY")
+    astra_db_endpoint: str = Field(..., env="ASTRA_DB_API_ENDPOINT")
+    astra_db_token: str = Field(..., env="ASTRA_DB_APPLICATION_TOKEN")
+    astra_db_keyspace: Optional[str] = Field(None, env="ASTRA_DB_KEYSPACE")
+    
+    # Batch processing
+    batch_size: int = 10
+    max_workers: int = 5
+    
+    # Rate limiting
+    tmdb_rate_limit: int = 40  # requests per 10 seconds
+    gemini_rate_limit: int = 60  # requests per minute
+    
+    # Retry configuration
+    max_retries: int = 3
+    retry_delay: int = 2  # seconds
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
-ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT", "")
-ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN", "")
-ASTRA_DB_KEYSPACE = os.getenv("ASTRA_DB_KEYSPACE")  # optional on serverless
+# Load settings
+settings = Settings()
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing in .env")
-if not TMDB_API_KEY:
-    raise RuntimeError("TMDB_API_KEY is missing in .env")
-if not ASTRA_DB_API_ENDPOINT or not ASTRA_DB_APPLICATION_TOKEN:
-    raise RuntimeError("ASTRA_DB_API_ENDPOINT or ASTRA_DB_APPLICATION_TOKEN missing in .env")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('movie_loader.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Global state for graceful shutdown
+shutdown_event = False
 
-# text-embedding-004 returns 768-d vectors
-EMBEDDING_MODEL = "text-embedding-004"
-VECTOR_DIMENSION = 768
-VECTOR_METRIC = "cosine"
+# Signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    global shutdown_event
+    logger.warning("Shutdown signal received. Finishing current batch...")
+    shutdown_event = True
 
-TMDB_BASE_URL = "https://api.themoviedb.org/3"
-HEADERS_TMDB = {"Authorization": f"Bearer {TMDB_API_KEY}"} if TMDB_API_KEY and TMDB_API_KEY.startswith("eyJ") else {}
-
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # ---------- Astra helpers ----------
 def get_astra_collection(collection_name: str):
@@ -81,11 +119,11 @@ def get_astra_collection(collection_name: str):
 
     Respects `ASTRA_DB_KEYSPACE` when provided.
     """
-    client = DataAPIClient(ASTRA_DB_APPLICATION_TOKEN)
-    database = client.get_database(ASTRA_DB_API_ENDPOINT)
+    client = DataAPIClient(settings.astra_db_token)
+    database = client.get_database(settings.astra_db_endpoint)
 
     created_now = False
-    keyspace = ASTRA_DB_KEYSPACE
+    keyspace = settings.astra_db_keyspace
     if keyspace:
         logging.info(f"Using keyspace='{keyspace}' for collection '{collection_name}'")
     else:
@@ -105,7 +143,7 @@ def get_astra_collection(collection_name: str):
         try:
             definition = CollectionDefinition(
                 vector=CollectionVectorOptions(
-                    dimension=VECTOR_DIMENSION,
+                    dimension=768,
                     metric=VectorMetric.COSINE,
                 )
             )
@@ -115,7 +153,7 @@ def get_astra_collection(collection_name: str):
                 database.create_collection(collection_name, definition=definition)
             created_now = True
             logging.info(
-                f"Requested creation of collection '{collection_name}' (dim={VECTOR_DIMENSION}, metric={VECTOR_METRIC})"
+                f"Requested creation of collection '{collection_name}' (dim=768, metric=COSINE)"
             )
         except Exception as e:
             # Surface permissions/misconfig immediately
@@ -191,7 +229,7 @@ LAST_API_CALL_TIME = 0
     retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
     reraise=True
 )
-def generate_embedding(text: str, model_name: str = "models/embedding-001") -> List[float]:
+def generate_embedding(text: str, model_name: str = "text-embedding-004") -> List[float]:
     """Generate a Gemini embedding for the given text with retries and rate limiting.
 
     Args:
@@ -207,7 +245,7 @@ def generate_embedding(text: str, model_name: str = "models/embedding-001") -> L
 
     Example:
         >>> embedding = generate_embedding("Sample movie plot")
-        >>> len(embedding) == VECTOR_DIMENSION
+        >>> len(embedding) == 768
         True
     """
     global LAST_API_CALL_TIME
@@ -219,7 +257,7 @@ def generate_embedding(text: str, model_name: str = "models/embedding-001") -> L
     text = text.strip()
     if not text:
         logging.warning("Empty text provided for embedding, returning zero vector")
-        return [0.0] * VECTOR_DIMENSION
+        return [0.0] * 768
 
     # Rate limiting
     current_time = time.time()
@@ -270,22 +308,46 @@ def _check_response(resp: requests.Response) -> None:
         raise RuntimeError(f"TMDB error: {resp.status_code} - {resp.text[:200]}")
 
 
+# TMDB API rate limiter (40 requests per 10 seconds)
+TMDB_RATE_LIMIT = 40
+TMDB_PERIOD = 10  # seconds
+
+@sleep_and_retry
+@limits(calls=TMDB_RATE_LIMIT, period=TMDB_PERIOD)
+def tmdb_rate_limiter():
+    """Enforce rate limiting for TMDB API."""
+    pass
+
 @retry(
-    reraise=True,
-    retry=retry_if_exception_type(TransientHTTPError),
-    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type((requests.RequestException, TransientHTTPError)),
+    stop=stop_after_attempt(settings.max_retries),
     wait=wait_exponential(multiplier=1, min=1, max=10),
+    before_sleep=lambda retry_state: logger.warning(
+        f"Retrying {retry_state.fn.__name__} after "
+        f"{retry_state.outcome.exception()}... "
+        f"Attempt {retry_state.attempt_number}/{settings.max_retries}"
+    )
 )
 def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{TMDB_BASE_URL}{path}"
-    if HEADERS_TMDB:
-        resp = requests.get(url, headers=HEADERS_TMDB, params=params, timeout=30)
-    else:
-        # API key via query param
-        params = {**params, "api_key": TMDB_API_KEY}
-        resp = requests.get(url, params=params, timeout=30)
-    _check_response(resp)
-    return resp.json()
+    """Make a GET request to TMDB API with rate limiting and retries."""
+    tmdb_rate_limiter()  # Enforce rate limiting
+    
+    url = f"https://api.themoviedb.org/3{path}"
+    headers = {"Authorization": f"Bearer {settings.tmdb_api_key}"} if settings.tmdb_api_key.startswith("eyJ") else {}
+    
+    try:
+        if headers:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        else:
+            params = {**params, "api_key": settings.tmdb_api_key}
+            resp = requests.get(url, params=params, timeout=30)
+            
+        _check_response(resp)
+        return resp.json()
+        
+    except requests.RequestException as e:
+        logger.error(f"TMDB API request failed: {e}")
+        raise
 
 
 def discover_movies(year_start: int = 2000, year_end: int = 2025, min_rating: float = 6.0, max_pages_per_year: int = 5) -> Generator[Dict[str, Any], None, None]:
@@ -425,40 +487,114 @@ def insert_if_new(collection, movie_doc: Dict[str, Any]) -> bool:
     return True
 
 
-def main() -> None:
-    collection = get_astra_collection("movies")
-
+def process_movie_batch(movie_batch: List[Dict[str, Any]], collection) -> Tuple[int, int]:
+    """Process a batch of movies with error handling and retries."""
     inserted = 0
     skipped = 0
-
-    # Iterate discovered movies and enrich
-    logging.info("Discovering movies from TMDB... this can take a few minutes on first run")
-    items = list(discover_movies())
-    logging.info(f"Discovered {len(items)} candidate movies from TMDB")
-
-    for item in tqdm(items, desc="Ingesting movies"):
-        movie_id = item.get("id")
-        if not movie_id:
-            continue
-
-        try:
-            details = fetch_movie_details(int(movie_id))
-            if not details:
-                continue
-            movie_doc = extract_movie_document(details)
-            if not movie_doc:
-                continue
-            if insert_if_new(collection, movie_doc):
-                inserted += 1
-            else:
+    
+    with ThreadPoolExecutor(max_workers=settings.max_workers) as executor:
+        future_to_movie = {
+            executor.submit(process_single_movie, movie, collection): movie 
+            for movie in movie_batch
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_movie):
+            movie = future_to_movie[future]
+            try:
+                result = future.result()
+                if result:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                logger.error(f"Error processing movie {movie.get('id')}: {exc}", exc_info=True)
                 skipped += 1
-        except Exception as exc:
-            logging.warning(f"Skipping movie id={movie_id} due to error: {exc}")
+    
+    return inserted, skipped
 
-    logging.info(f"Done. Inserted: {inserted}, Skipped (duplicates): {skipped}")
+def process_single_movie(movie: Dict[str, Any], collection) -> bool:
+    """Process a single movie with retries and error handling."""
+    if shutdown_event:
+        return False
+        
+    movie_id = movie.get("id")
+    if not movie_id:
+        return False
+
+    try:
+        details = fetch_movie_details(int(movie_id))
+        if not details:
+            return False
+            
+        movie_doc = extract_movie_document(details)
+        if not movie_doc:
+            return False
+            
+        return insert_if_new(collection, movie_doc)
+        
+    except Exception as exc:
+        logger.error(f"Error processing movie ID {movie_id}: {exc}", exc_info=True)
+        return False
+
+def main() -> None:
+    """Main entry point with batch processing and parallel execution."""
+    global shutdown_event
+    
+    try:
+        # Initialize collection with connection pooling
+        collection = get_astra_collection("movies")
+        
+        # Track metrics
+        total_inserted = 0
+        total_skipped = 0
+        start_time = time.time()
+        
+        # Process movies in batches
+        logger.info("Starting movie data ingestion...")
+        movie_generator = discover_movies()
+        
+        while True:
+            if shutdown_event:
+                logger.info("Shutdown requested. Stopping after current batch...")
+                break
+                
+            # Get next batch
+            batch = []
+            for _ in range(settings.batch_size):
+                try:
+                    movie = next(movie_generator)
+                    batch.append(movie)
+                except StopIteration:
+                    break
+            
+            if not batch:
+                break  # No more movies to process
+                
+            logger.info(f"Processing batch of {len(batch)} movies...")
+            
+            # Process batch
+            inserted, skipped = process_movie_batch(batch, collection)
+            total_inserted += inserted
+            total_skipped += skipped
+            
+            logger.info(f"Batch complete. Inserted: {inserted}, Skipped: {skipped}")
+            
+            # Small delay between batches to avoid rate limiting
+            time.sleep(1)
+            
+        # Final statistics
+        duration = time.time() - start_time
+        logger.info(
+            f"Ingestion complete. "
+            f"Total inserted: {total_inserted}, "
+            f"Skipped: {total_skipped}, "
+            f"Duration: {duration:.2f} seconds"
+        )
+        
+    except Exception as e:
+        logger.critical(f"Fatal error in main process: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
     main()
-
-
