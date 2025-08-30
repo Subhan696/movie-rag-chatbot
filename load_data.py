@@ -174,34 +174,87 @@ def get_astra_collection(collection_name: str):
 
 
 # ---------- Embeddings ----------
-def generate_embedding(text: str) -> List[float]:
-    """Generate a Gemini embedding for given text.
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import time
+from typing import Optional, List, Dict, Any
+import logging
 
-    Handles minor response shape variations between SDK versions.
+# Configuration
+EMBEDDING_MAX_RETRIES = 3
+EMBEDDING_RETRY_WAIT_SECONDS = 2
+EMBEDDING_RATE_LIMIT_DELAY = 0.1  # 100ms delay between API calls
+LAST_API_CALL_TIME = 0
+
+@retry(
+    stop=stop_after_attempt(EMBEDDING_MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
+    reraise=True
+)
+def generate_embedding(text: str, model_name: str = "models/embedding-001") -> List[float]:
+    """Generate a Gemini embedding for the given text with retries and rate limiting.
+
+    Args:
+        text: The input text to generate embedding for
+        model_name: The Gemini model to use for embeddings
+
+    Returns:
+        List[float]: A list of floats representing the embedding vector
+
+    Raises:
+        ValueError: If the input text is empty or invalid
+        Exception: For API errors after max retries
+
+    Example:
+        >>> embedding = generate_embedding("Sample movie plot")
+        >>> len(embedding) == VECTOR_DIMENSION
+        True
     """
-    text = (text or "").strip()
+    global LAST_API_CALL_TIME
+    
+    # Input validation
+    if not isinstance(text, str):
+        raise ValueError("Input text must be a string")
+        
+    text = text.strip()
     if not text:
+        logging.warning("Empty text provided for embedding, returning zero vector")
         return [0.0] * VECTOR_DIMENSION
 
-    result = genai.embed_content(model=EMBEDDING_MODEL, content=text)
-    # Possible response shapes: {"embedding": [...] } or {"embedding": {"values": [...]}}
-    embedding = None
-    if isinstance(result, dict):
-        emb = result.get("embedding")
-        if isinstance(emb, dict) and "values" in emb:
-            embedding = emb["values"]
-        else:
-            embedding = emb
-    else:
-        # Some SDKs return an object with .embedding
-        emb = getattr(result, "embedding", None)
-        if isinstance(emb, dict) and "values" in emb:
-            embedding = emb["values"]
-        else:
-            embedding = emb
+    # Rate limiting
+    current_time = time.time()
+    time_since_last_call = current_time - LAST_API_CALL_TIME
+    if time_since_last_call < EMBEDDING_RATE_LIMIT_DELAY:
+        time.sleep(EMBEDDING_RATE_LIMIT_DELAY - time_since_last_call)
+    
+    try:
+        # Generate embedding with error handling for API response
+        response = genai.embed_content(
+            model=model_name,
+            content=text,
+            task_type="retrieval_document"
+        )
+        
+        # Update last API call time
+        LAST_API_CALL_TIME = time.time()
+        
+        # Handle different response formats
+        if isinstance(response, dict):
+            embedding = response.get('embedding', [])
+        else:  # Handle newer SDK versions
+            embedding = getattr(response, 'embedding', [])
+            
+        if not embedding or not isinstance(embedding, list):
+            raise ValueError("Invalid embedding response format")
+            
+        return embedding
+        
+    except Exception as e:
+        logging.error(f"Error generating embedding: {str(e)}")
+        if "quota" in str(e).lower():
+            raise RuntimeError("API quota exceeded") from e
+        raise  # Re-raise to trigger retry
 
-    if not isinstance(embedding, list):
-        raise RuntimeError("Unexpected embedding response shape from Gemini")
     return embedding
 
 
